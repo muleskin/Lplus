@@ -2,7 +2,7 @@ using System.Drawing.Drawing2D;
 
 namespace Lplus;
 
-/// <summary>The Settings page: Cloud, network, model location, tools and context length.</summary>
+/// <summary>The Settings page: Cloud, network, model location, tools, MCP servers and context length.</summary>
 sealed class SettingsView : Control
 {
     public static readonly int[] ContextOptions = { 4096, 8192, 16384, 32768, 65536, 131072, 262144 };
@@ -21,6 +21,10 @@ sealed class SettingsView : Control
 
     public event Action<Settings>? Changed;
     public event Action? ViewLogs;
+    public event Action? ManageMcp;
+    /// <summary>One line per MCP server: its name, what it is doing, and whether it works.</summary>
+    public List<(string name, string status, bool ok)> McpLines = new();
+    public string? McpNote;
 
     public SettingsView()
     {
@@ -30,6 +34,7 @@ sealed class SettingsView : Control
     }
 
     public void Load(Settings s) { _s = s.Clone(); Invalidate(); }
+    public void ScrollTo(int pixels) { _scroll = Math.Max(0, pixels); Invalidate(); }
 
     void Commit()
     {
@@ -103,9 +108,10 @@ sealed class SettingsView : Control
         y = Card(g, x, y, w, new Action<Graphics, Rectangle>[]
         {
             (gg, r) => ToggleRow(gg, r, "Tools", "Let models read this PC's clock and, in Code mode, work in your project folder.", _s.ToolsEnabled, v => _s.ToolsEnabled = v),
+            (gg, r) => ToggleRow(gg, r, "Web access", "Let models search the web and read pages to look things up.", _s.WebEnabled, v => _s.WebEnabled = v),
             (gg, r) =>
             {
-                Row(gg, new Rectangle(r.X, r.Y, r.Width, Theme.S(60)), "Project folder", "In Code mode, models can read and search this folder, and change files after you confirm.");
+                Row(gg, new Rectangle(r.X, r.Y, r.Width, Theme.S(60)), "Project folder", "In Code mode, models can read this folder, and change files and run commands after you confirm.");
                 var pr = new Rectangle(r.X + Theme.S(16), r.Y + Theme.S(62), r.Width - Theme.S(132), Theme.S(34));
                 Theme.FillRound(gg, Theme.UserBubble, pr, Theme.S(8));
                 bool none = string.IsNullOrEmpty(_s.ProjectFolder);
@@ -122,7 +128,35 @@ sealed class SettingsView : Control
                     _hits.Add((rr, () => { _s.ProjectFolder = ""; Commit(); }));
                 }
             },
-        }, Theme.S(76), Theme.S(128));
+        }, Theme.S(76), Theme.S(76), Theme.S(128));
+
+        // MCP servers: extra tools from the person's own servers.
+        int mcpRows = Math.Max(1, McpLines.Count) + (McpNote != null ? 1 : 0);
+        y = Card(g, x, y, w, new Action<Graphics, Rectangle>[]
+        {
+            (gg, r) =>
+            {
+                Row(gg, new Rectangle(r.X, r.Y, r.Width - Theme.S(70), Theme.S(60)), "MCP servers", "Extra tools from your own servers, in both modes.");
+var mg = Button(gg, "Manage", r.Right - Theme.S(16), r.Y + Theme.S(36));
+                _hits.Add((mg, () => ManageMcp?.Invoke()));
+                int lx = r.X + Theme.S(16), ly = r.Y + Theme.S(68), lw = r.Width - Theme.S(32), lh = Theme.S(22);
+                if (McpNote != null)
+                {
+                    Theme.DrawEllipsis(gg, McpNote, Theme.Small, Theme.ErrorText, new Rectangle(lx, ly, lw, lh));
+                    ly += lh;
+                }
+                if (McpLines.Count == 0)
+                    Theme.DrawEllipsis(gg, "No servers switched on. Click Manage to add or find one.", Theme.Small, Theme.Muted, new Rectangle(lx, ly, lw, lh));
+                foreach (var (name, status, ok) in McpLines)
+                {
+                    using (var dot = new SolidBrush(ok ? Theme.Green : Theme.BorderStrong)) gg.FillEllipse(dot, lx, ly + Theme.S(6), Theme.S(8), Theme.S(8));
+                    var ns = Theme.Measure(name, Theme.SmallBold);
+                    Theme.DrawEllipsis(gg, name, Theme.SmallBold, Theme.TextBody, new Rectangle(lx + Theme.S(16), ly, ns.Width + Theme.S(4), lh));
+                    Theme.DrawEllipsis(gg, status, Theme.Small, Theme.Muted, new Rectangle(lx + Theme.S(24) + ns.Width, ly, lw - Theme.S(24) - ns.Width, lh));
+                    ly += lh;
+                }
+            },
+        }, Theme.S(78) + Theme.S(22) * mcpRows);
 
         y = Card(g, x, y, w, new Action<Graphics, Rectangle>[]
         {

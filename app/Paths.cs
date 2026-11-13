@@ -6,6 +6,7 @@ static class Paths
     public static string DataDir { get; } = Init();
     public static string Database => Path.Combine(DataDir, "db.sqlite");
     public static string AppLog => Path.Combine(DataDir, "app.log");
+    public static string McpConfig => Path.Combine(DataDir, "mcp.json");
     public static string ServerLog => Path.Combine(DataDir, "server.log");
     public static string PidFile => Path.Combine(DataDir, "server.pid");
     public static string ImageDir => Directory.CreateDirectory(Path.Combine(DataDir, "images")).FullName;

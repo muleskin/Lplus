@@ -10,10 +10,41 @@ namespace Lplus;
 static class SelfTest
 {
     /// <summary>
-    /// "--toolrun &lt;report.txt&gt; &lt;model&gt; &lt;folder&gt; &lt;question&gt;": asks one question with the tools on and
-    /// writes down every tool step and the answer. Files are never written (every write is declined).
+    /// "--mcp-check &lt;report.txt&gt;": connects to every server in mcp.json and writes down how each one
+    /// answered (its protocol, what it offers and its tools). No tool is run.
     /// </summary>
-    public static async Task<int> ToolRun(string report, string model, string folder, string question)
+    public static async Task<int> McpCheck(string report)
+    {
+        var sb = new StringBuilder();
+        void P(string s) { sb.AppendLine(s); File.WriteAllText(report, sb.ToString()); }
+        using var hub = new McpHub();
+        P("Servers in " + Paths.McpConfig);
+        await hub.Load(Paths.McpConfig);
+        if (hub.ConfigError != null) P(hub.ConfigError);
+        foreach (var c in hub.Configs)
+        {
+            var (status, ok, _) = hub.StatusOf(c);
+            var conn = hub.Connection(c.Name);
+            P($"{c.Name}: {(ok ? "connected" : status)}");
+            P($"  {(c.IsHttp ? "Address" : "Command")}: {c.Summary}");
+            if (conn is not { Ready: true }) continue;
+            P($"  Server: {conn.ServerName}; protocol {conn.ProtocolVersion}; offers {string.Join(", ", conn.Capabilities)}");
+            P($"  Tools ({conn.Tools.Count}): {string.Join(", ", conn.Tools.Select(t => t.name))}");
+        }
+        return hub.Configs.Count > 0 && hub.Configs.Where(c => !c.Disabled).All(c => hub.StatusOf(c).ok) ? 0 : 1;
+    }
+
+    static JsonArray WithMcp(JsonArray tools, McpHub hub)
+    {
+        foreach (var d in hub.Definitions()) tools.Add(d?.DeepClone());
+        return tools;
+    }
+
+    /// <summary>
+    /// "--toolrun &lt;report.txt&gt; &lt;model&gt; &lt;folder&gt; &lt;question&gt;": asks one question with the tools on and
+    /// writes down every tool step and the answer. Web lookups are allowed; no file is written and no command is run, unless the word "apply" follows the question (for a throwaway folder).
+    /// </summary>
+    public static async Task<int> ToolRun(string report, string model, string folder, string question, bool apply = false)
     {
         var sb = new StringBuilder();
         void P(string s) { sb.AppendLine(s); File.WriteAllText(report, sb.ToString()); }
@@ -25,21 +56,33 @@ static class SelfTest
             var caps = await client.Capabilities(model);
             bool canCall = caps.Contains("tools");
             P($"model {model}; can call tools: {canCall}; folder: {folder}");
+            // The MCP servers in mcp.json take part too; their tools run only with "apply".
+            using var hub = new McpHub();
+            await hub.Load(Paths.McpConfig);
+            if (hub.ConfigError != null) P(hub.ConfigError);
+            foreach (var (name, status, _) in hub.Status()) P($"MCP server {name}: {status}");
             var msgs = new JsonArray
             {
-                new JsonObject { ["role"] = "system", ["content"] = Tools.SystemNote(canCall, folder) },
+                new JsonObject { ["role"] = "system", ["content"] = Tools.SystemNote(canCall, folder, true) },
                 new JsonObject { ["role"] = "user", ["content"] = question },
             };
             async Task<string> RunTool(string name, JsonNode? args)
             {
-                var result = await Tools.Run(name, args, folder, (f, e) => { P($"  (declined write of {f})"); return Task.FromResult(false); });
+                if (hub.Find(name) is { } mt)
+                {
+                    var answer = apply ? await mt.Server.Call(mt.Name, args) : Tools.Declined;
+                    P($"MCP {mt.Server.Config.Name}: {mt.Name} {args?.ToJsonString()} -> {(answer.Length > 300 ? answer[..300] + "…" : answer).Replace("\n", " | ")}");
+                    return answer;
+                }
+                var result = await Tools.Run(name, args, folder, (f, e) => { P($"  ({(apply ? "allowed" : "declined")} write of {f})"); return Task.FromResult(apply); },
+                    true, (c, f) => { P($"  ({(apply ? "allowed" : "declined")} command {c})"); return Task.FromResult(apply); });
                 P($"TOOL {name} {args?.ToJsonString()} -> {result.Length} chars: {(result.Length > 300 ? result[..300] + "…" : result).Replace("\n", " | ")}");
                 return result;
             }
             var said = new StringBuilder();
             using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(10));
             await Tools.Converse(client, model, msgs, caps.Contains("thinking") ? JsonValue.Create(false) : null,
-                canCall ? Tools.Definitions(folder) : null, RunTool, (c, _) => said.Append(c), cts.Token);
+                canCall ? WithMcp(Tools.Definitions(folder, true), hub) : null, RunTool, (c, _) => said.Append(c), cts.Token);
             P("ANSWER:");
             P(said.ToString());
             return 0;
@@ -94,7 +137,8 @@ static class SelfTest
 
             var clock = await Tools.Run("get_current_time", null, "", Yes);
             Check(clock.Contains(DateTime.Now.Year.ToString()) && clock.Contains("UTC"), "clock tool: " + clock);
-            Check(Tools.Definitions("").Count == 1 && Tools.Definitions(proj).Count == 5, "tools offered: clock only without a project folder, 5 with one");
+            Check(Tools.Definitions("").Count == 1 && Tools.Definitions("", web: true).Count == 3 && Tools.Definitions(proj).Count == 7 && Tools.Definitions(proj, web: true).Count == 9,
+                "tools offered: the clock alone, +2 with web access, +6 with a project folder");
             var asText = Tools.TextCalls("{\n  \"name\": \"list_files\",\n  \"arguments\": {}\n}\n\n{\n  \"name\": \"read_file\",\n  \"arguments\": {\n    \"path\": \"a {b}.js\"\n  }\n}", Tools.Definitions(proj));
             Check(asText.Count == 2 && asText[1]["function"]?["arguments"]?["path"]?.GetValue<string>() == "a {b}.js"
                 && Tools.TextCalls("{\"name\": \"list_files\"} and some words", Tools.Definitions(proj)).Count == 0
@@ -113,6 +157,203 @@ static class SelfTest
             var outside = await Tools.Run("read_file", A(("path", "..\\..\\outside.txt")), proj, Yes);
             var outside2 = await Tools.Run("write_file", A(("path", "C:\\Windows\\lplus-test.txt"), ("content", "x")), proj, Yes);
             Check(outside.Contains("outside the project folder") && outside2.Contains("outside the project folder"), "paths outside the project folder are refused");
+
+            // Changing part of a file.
+            var edited = await Tools.Run("edit_file", A(("path", "src/app.py"), ("old_text", "    return 'hello from the old app'"), ("new_text", "    return 'hello from the new app'")), proj, Yes);
+            Check(edited.StartsWith("Edited src/app.py at line 2") && File.ReadAllText(Path.Combine(proj, "src", "app.py")) == "def greet():\n    return 'hello from the new app'\n", "edit_file: " + edited);
+            File.WriteAllText(Path.Combine(proj, "src", "win.cs"), "class A\r\n{\r\n    int X = 1;\r\n    int Y = 2;\r\n}\r\n");
+            var loose = await Tools.Run("edit_file", A(("path", "win.cs"), ("old_text", "int X = 1;\nint Y = 2;"), ("new_text", "    int X = 10;\n    int Y = 20;")), proj, Yes);
+            Check(loose.StartsWith("Edited") && File.ReadAllText(Path.Combine(proj, "src", "win.cs")) == "class A\r\n{\r\n    int X = 10;\r\n    int Y = 20;\r\n}\r\n",
+                "edit_file finds the lines despite different indentation and keeps the file's line endings: " + loose);
+            var missing = await Tools.Run("edit_file", A(("path", "src/app.py"), ("old_text", "not in the file"), ("new_text", "x")), proj, Yes);
+            File.WriteAllText(Path.Combine(proj, "src", "twice.txt"), "same\nsame\n");
+            var twice = await Tools.Run("edit_file", A(("path", "src/twice.txt"), ("old_text", "same"), ("new_text", "x")), proj, Yes);
+            var editNo = await Tools.Run("edit_file", A(("path", "src/app.py"), ("old_text", "new app"), ("new_text", "x")), proj, No);
+            Check(missing.Contains("was not found") && twice.Contains("more than once") && editNo == Tools.Declined && File.ReadAllText(Path.Combine(proj, "src", "twice.txt")) == "same\nsame\n",
+                "edit_file refuses text that is missing or appears twice, and leaves the file alone when declined");
+            File.WriteAllText(Path.Combine(proj, "src", "app.py"), "def greet():\n    return 'hello from the old app'\n");
+
+            // Running a command in the project folder.
+            Task<bool> YesCmd(string c, string f) => Task.FromResult(true);
+            var ran = await Tools.Run("run_command", A(("command", "echo built ok && cd")), proj, Yes, false, YesCmd);
+            Check(ran.StartsWith("Exit code 0 (success)") && ran.Contains("built ok") && ran.Contains(Path.GetFileName(proj)), "run_command runs in the project folder: " + ran.Replace("\r", "").Replace("\n", " | "));
+            var failed = await Tools.Run("run_command", A(("command", "echo oops 1>&2 && exit /b 3")), proj, Yes, false, YesCmd);
+            Check(failed.StartsWith("Exit code 3 (failed)") && failed.Contains("oops"), "run_command reports a failure and its error output: " + failed.Replace("\r", "").Replace("\n", " | "));
+            var slow = await Tools.RunCommand(proj, "ping -n 30 127.0.0.1", TimeSpan.FromSeconds(2));
+            Check(slow.StartsWith("Stopped:"), "a command that runs too long is stopped: " + slow.Split('\n')[0]);
+            var notAsked = await Tools.Run("run_command", A(("command", "echo hi")), proj, Yes);
+            var cmdNo = await Tools.Run("run_command", A(("command", "echo hi")), proj, Yes, false, (c, f) => Task.FromResult(false));
+            Check(notAsked == Tools.Declined && cmdNo == Tools.Declined, "run_command does nothing unless the person agrees");
+            if (File.Exists(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "dotnet", "dotnet.exe")))
+            {
+                var cs = Path.Combine(proj, "cs");
+                Directory.CreateDirectory(cs);
+                File.WriteAllText(Path.Combine(cs, "t.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>");
+                File.WriteAllText(Path.Combine(cs, "Program.cs"), "System.Console.WriteLine(1 +);\n");
+                var bad = await Tools.Run("run_command", A(("command", "dotnet build cs")), proj, Yes, false, YesCmd);
+                await Tools.Run("edit_file", A(("path", "cs/Program.cs"), ("old_text", "1 +"), ("new_text", "1 + 1")), proj, Yes);
+                var good = await Tools.Run("run_command", A(("command", "dotnet build cs")), proj, Yes, false, YesCmd);
+                Check(bad.Contains("(failed)") && bad.Contains("error CS") && good.Contains("(success)"),
+                    "a compiler run shows the error, and passes after the fix: " + bad.Split('\n').FirstOrDefault(l => l.Contains("error CS"))?.Trim());
+            }
+            else P("INFO the .NET SDK is not installed, so the compiler check was skipped");
+
+            // The web: reading a results page and a web page (no network), then the real thing.
+            var sample = "<div><a rel=\"nofollow\" class=\"result__a\" href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fdocs%3Fa%3D1&amp;rut=x\">Example <b>Docs</b></a>"
+                + "<a class=\"result__snippet\" href=\"x\">How to &amp; why</a></div>";
+            var parsed = Tools.ParseSearch(sample);
+            Check(parsed.Count == 1 && parsed[0] == ("Example Docs", "https://example.org/docs?a=1", "How to & why"), "search results are read from the results page");
+            var pageText = Tools.PageText("<html><head><title>Docs</title><style>p{}</style></head><body><script>var x=1;</script><h1>Title</h1><p>One&nbsp;two <b>three</b></p><ul><li>a</li><li>b</li></ul></body></html>");
+            Check(pageText == "Docs\nTitle\nOne two three\na\nb", "a web page is reduced to its text: " + pageText.Replace("\n", " | "));
+            var off = await Tools.Run("web_search", A(("query", "x")), proj, Yes);
+            var local = await Tools.Run("fetch_url", A(("url", "http://127.0.0.1:11434/api/tags")), proj, Yes, true);
+            var local2 = await Tools.Run("fetch_url", A(("url", "http://192.168.1.1/")), proj, Yes, true);
+            var notWeb = await Tools.Run("fetch_url", A(("url", "file:///C:/Windows/win.ini")), proj, Yes, true);
+            Check(off.Contains("turned off") && local.Contains("not available") && local2.Contains("not available") && notWeb.Contains("not a web address"),
+                "web tools are refused when web access is off, and never open this PC, the local network or files");
+            var page = await Tools.Run("fetch_url", A(("url", "https://example.com")), proj, Yes, true);
+            if (page.StartsWith("Error: could not open")) P("INFO this PC seems to be offline, so the live web checks were skipped: " + page);
+            else
+            {
+                Check(page.Contains("Example Domain"), "fetch_url reads a live page: " + page.Replace("\n", " | "));
+                var hits = await Tools.Run("web_search", A(("query", "dotnet build command documentation")), proj, Yes, true);
+                Check(hits.StartsWith("1. ") && hits.Contains("http"), "web_search returns live results: " + hits.Split('\n')[0] + " | " + hits.Split('\n')[1].Trim());
+            }
+
+            // MCP servers: one started as a program (this exe's own test server), one over HTTP, one that cannot start.
+            int port;
+            using (var probe = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0)) { probe.Start(); port = ((System.Net.IPEndPoint)probe.LocalEndpoint).Port; }
+            using var web = new System.Net.HttpListener();
+            web.Prefixes.Add($"http://localhost:{port}/mcp/");
+            web.Start();
+            bool sawSession = false, sawHeader = false, sawVersion = false;
+            var serving = Task.Run(async () =>
+            {
+                while (web.IsListening)
+                {
+                    System.Net.HttpListenerContext ctx;
+                    try { ctx = await web.GetContextAsync(); } catch { break; }
+                    using var body = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
+                    var msg = JsonNode.Parse(await body.ReadToEndAsync())!;
+                    sawSession |= ctx.Request.Headers["Mcp-Session-Id"] == "session-1";
+                    sawHeader |= ctx.Request.Headers["X-Test-Key"] == "abc";
+                    sawVersion |= ctx.Request.Headers["MCP-Protocol-Version"] == McpConnection.Protocol;
+                    var reply = McpTestServer.Handle(msg);
+                    ctx.Response.Headers["Mcp-Session-Id"] = "session-1";
+                    if (reply == null) { ctx.Response.StatusCode = 202; ctx.Response.Close(); continue; }
+                    // Tool answers go out as an event stream, the rest as plain JSON: a client must take both.
+                    bool stream = msg["method"]?.GetValue<string>() == "tools/call";
+                    var bytes = Encoding.UTF8.GetBytes(stream ? "event: message\ndata: " + reply.ToJsonString() + "\n\n" : reply.ToJsonString());
+                    ctx.Response.ContentType = stream ? "text/event-stream" : "application/json";
+                    await ctx.Response.OutputStream.WriteAsync(bytes);
+                    ctx.Response.Close();
+                }
+            });
+            var mcpFile = Path.Combine(proj, "mcp.json");
+            File.WriteAllText(mcpFile, new JsonObject
+            {
+                ["mcpServers"] = new JsonObject
+                {
+                    ["local"] = new JsonObject { ["command"] = Environment.ProcessPath, ["args"] = new JsonArray("--mcp-test-server") },
+                    ["remote"] = new JsonObject { ["url"] = $"http://localhost:{port}/mcp/", ["headers"] = new JsonObject { ["X-Test-Key"] = "abc" } },
+                    ["broken"] = new JsonObject { ["command"] = "no-such-program-lplus-test" },
+                    ["off"] = new JsonObject { ["command"] = "whatever", ["disabled"] = true },
+                },
+            }.ToJsonString());
+            using (var hub = new McpHub())
+            {
+                await hub.Load(mcpFile);
+                var st = hub.Status();
+                Check(st.Count == 3 && st.Any(x => x.name == "local" && x.ok && x.status == "3 tools") && st.Any(x => x.name == "remote" && x.ok) && st.Any(x => x.name == "broken" && !x.ok),
+                    "MCP servers started (a program and a web address) and a broken one is reported: " + string.Join("; ", st.Select(x => $"{x.name} = {x.status}")));
+                Check(hub.Tools.Count == 6 && hub.Find("local_add") != null && hub.Find("remote_echo") != null && hub.Definitions().Count == 6,
+                    "their tools are offered as: " + string.Join(", ", hub.Tools.Select(t => t.Exposed)));
+                if (hub.Find("local_add") is { } add && hub.Find("remote_echo") is { } echo && hub.Find("local_fail") is { } fail && hub.Find("remote_add") is { } radd)
+                {
+                    var sum = await add.Server.Call(add.Name, new JsonObject { ["a"] = 2, ["b"] = 3 });
+                    var back = await echo.Server.Call(echo.Name, new JsonObject { ["text"] = "héllo ✓" });
+                    var rsum = await radd.Server.Call(radd.Name, new JsonObject { ["a"] = 40, ["b"] = 2.5 });
+                    var bad = await fail.Server.Call(fail.Name, null);
+                    Check(sum == "5" && back == "héllo ✓" && rsum == "42.5" && bad.StartsWith("Error:"), $"MCP tools run: add = {sum}, echo over HTTP = {back}, add over HTTP = {rsum}, fail = {bad}");
+                    Check(sawSession && sawHeader && sawVersion, "the HTTP server got the session id, the protocol version and the header from mcp.json");
+
+                    if (caps.Contains("tools"))
+                    {
+                        var usedMcp = new List<string>();
+                        async Task<string> RunMcp(string name, JsonNode? args)
+                        {
+                            usedMcp.Add(name);
+                            return hub.Find(name) is { } t ? await t.Server.Call(t.Name, args) : "Error: no such tool.";
+                        }
+                        var askMcp = new JsonArray { new JsonObject { ["role"] = "user", ["content"] = "Use the local_add tool to add 1234 and 4321, then tell me the sum." } };
+                        var saidMcp = new StringBuilder();
+                        await Tools.Converse(client, model, askMcp, caps.Contains("thinking") ? JsonValue.Create(false) : null, hub.Definitions(), RunMcp, (c, _) => saidMcp.Append(c), cts.Token);
+                        Check(usedMcp.Contains("local_add") && saidMcp.ToString().Replace(",", "").Contains("5555"),
+                            $"model used an MCP tool [{string.Join(", ", usedMcp)}] and said: \"{saidMcp.ToString().Trim().Replace("\n", " ")}\"");
+                    }
+                }
+            }
+            web.Stop();
+
+            // Changing the server list: saved to the file, one server connected and disconnected on its own.
+            var listFile = Path.Combine(proj, "mcp-list.json");
+            File.WriteAllText(listFile, "{ \"theme\": \"dark\", \"mcpServers\": { \"local\": { \"command\": \"x\", \"timeout\": 30, \"disabled\": true } } }");
+            using (var hub = new McpHub())
+            {
+                await hub.Load(listFile);
+                var mine = hub.Configs[0];
+                mine.Command = Environment.ProcessPath!;
+                mine.Args = new() { "--mcp-test-server" };
+                mine.Disabled = false;
+                hub.Configs.Add(new McpServerConfig { Name = "web one", Url = "https://example.com/mcp", Headers = { ["Authorization"] = "Bearer k" }, Disabled = true });
+                hub.Save();
+                var again = McpConfig.Load(listFile, out _);
+                var kept = JsonNode.Parse(File.ReadAllText(listFile))!;
+                Check(again.Count == 2 && again[0].Args.SequenceEqual(new[] { "--mcp-test-server" }) && !again[0].Disabled && again[1].Url == "https://example.com/mcp" && again[1].Headers["Authorization"] == "Bearer k" && again[1].Disabled
+                    && kept["theme"]?.GetValue<string>() == "dark" && kept["mcpServers"]?["local"]?["timeout"]?.GetValue<int>() == 30,
+                    "servers are saved to mcp.json and read back, and settings Lplus does not know are kept");
+                Check(hub.StatusOf(mine).status == "not connected" && hub.Tools.Count == 0, "a server added on the page waits to be connected");
+                await hub.Connect(mine);
+                var on = hub.StatusOf(mine);
+                hub.Disconnect("local");
+                Check(on.ok && on.status == "3 tools" && hub.Tools.Count == 0 && hub.StatusOf(mine).status == "not connected" && hub.StatusOf(hub.Configs[1]).status == "switched off",
+                    "one server is connected and disconnected on its own: " + on.status);
+            }
+
+            // Servers set up for other programs are found for importing.
+            var fakeHome = Path.Combine(proj, "home");
+            Directory.CreateDirectory(Path.Combine(fakeHome, "roaming", "Claude"));
+            File.WriteAllText(Path.Combine(fakeHome, ".claude.json"), "{ \"mcpServers\": { \"remote-tool\": { \"type\": \"stdio\", \"command\": \"ssh\", \"args\": [\"-o\", \"BatchMode=yes\", \"me@host\", \"/opt/tool\", \"serve\"], \"env\": {} } },"
+                + " \"projects\": { \"C:/work/app\": { \"mcpServers\": { \"docs\": { \"type\": \"http\", \"url\": \"https://example.com/mcp\" } } }, \"C:/work/other\": { \"mcpServers\": {} } } }");
+            File.WriteAllText(Path.Combine(fakeHome, "roaming", "Claude", "claude_desktop_config.json"), "{ \"mcpServers\": { \"remote-tool\": { \"command\": \"ssh\", \"args\": [\"-o\", \"BatchMode=yes\", \"me@host\", \"/opt/tool\", \"serve\"] }, \"notes\": { \"command\": \"npx\", \"args\": [\"-y\", \"notes-mcp\"] } } }");
+            File.WriteAllText(Path.Combine(fakeHome, ".mcp.json"), "{ broken");
+            var elsewhere = McpConfig.FoundElsewhere(fakeHome, Path.Combine(fakeHome, "roaming"));
+            Check(elsewhere.Count == 3 && elsewhere[0].server.Summary == "ssh -o BatchMode=yes me@host /opt/tool serve" && elsewhere[0].from == "Claude Code"
+                && elsewhere[1].server.Url == "https://example.com/mcp" && elsewhere[1].from == "Claude Code, project app" && elsewhere[2].server.Name == "notes" && elsewhere[2].from == "Claude desktop app",
+                "servers set up for other programs are found, each once: " + string.Join("; ", elsewhere.Select(x => $"{x.server.Name} ({x.from})")));
+
+            // Finding servers in the public registry.
+            var reg = McpRegistry.Parse("{\"servers\":[{\"server\":{\"name\":\"io.example/weather\",\"description\":\"Forecasts\",\"version\":\"1.2.0\",\"repository\":{\"url\":\"https://example.com/w\"},"
+                + "\"packages\":[{\"registryType\":\"npm\",\"identifier\":\"weather-mcp\",\"runtimeHint\":\"npx\",\"transport\":{\"type\":\"stdio\"},\"runtimeArguments\":[{\"type\":\"positional\",\"value\":\"-y\"}],"
+                + "\"packageArguments\":[{\"type\":\"named\",\"name\":\"--units\",\"value\":\"metric\"}],"
+                + "\"environmentVariables\":[{\"name\":\"KEY\",\"isRequired\":true,\"description\":\"Your key\"},{\"name\":\"REGION\",\"default\":\"us\"},{\"name\":\"EXTRA\"}]}]}},"
+                + "{\"server\":{\"name\":\"io.example/weather\",\"version\":\"1.1.0\"}},"
+                + "{\"server\":{\"name\":\"io.example/notes\",\"remotes\":[{\"type\":\"sse\",\"url\":\"https://old\"},{\"type\":\"streamable-http\",\"url\":\"https://example.com/mcp\",\"headers\":[{\"name\":\"Authorization\",\"description\":\"Your token\"}]}]}},"
+                + "{\"server\":{\"name\":\"io.example/odd\",\"packages\":[{\"registryType\":\"mcpb\",\"identifier\":\"x\"}]}}]}");
+            var wx = reg.Count > 0 ? reg[0].Suggested : null;
+            Check(reg.Count == 3 && wx != null && wx.Name == "weather" && wx.Summary == "npx -y weather-mcp --units metric" && wx.Env.Count == 2 && wx.Env["KEY"] == "" && wx.Env["REGION"] == "us" && reg[0].Notes.Count == 3
+                && reg[1].Suggested is { Url: "https://example.com/mcp" } nt && nt.Headers.ContainsKey("Authorization") && reg[2].Suggested == null,
+                "registry entries become servers ready to add: " + string.Join("; ", reg.Select(r => r.Name + " = " + (r.Suggested?.Summary ?? "cannot be added"))));
+            try
+            {
+                var live = await McpRegistry.Search("github");
+                Check(live.Count > 0 && live.Any(r => r.Suggested != null), $"the public registry answers a search: {live.Count} servers for \"github\", first: {live[0].Name}");
+            }
+            catch (Exception ex) { P("INFO the public MCP registry could not be reached, so the live search was skipped: " + ex.Message); }
+            var (parsed2, parseError) = (McpConfig.Load(mcpFile, out var e1), e1);
+            File.WriteAllText(mcpFile, "{ not json");
+            McpConfig.Load(mcpFile, out var e2);
+            Check(parsed2.Count == 4 && parseError == null && parsed2[3].Disabled && e2 != null, "mcp.json is read, and a broken file is reported: " + e2);
 
             // Live: a model that can call tools reads the clock and the project's code.
             if (caps.Contains("tools"))
@@ -222,6 +463,25 @@ static class SelfTest
             }
             Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
             try { File.Delete(hdb); } catch { }
+
+            // The add/edit server form: what is typed becomes a server, and mistakes are pointed out.
+            using (var form = new McpServerDialog(new McpServerConfig(), new List<string> { "files" }, isNew: true, notes: null))
+            {
+                form.TypeForTest("files", true, "", new string[0], new string[0], "", new string[0]);
+                var taken = form.ReadForTest() == null ? form.Problem : "";
+                form.TypeForTest("notes", true, " npx ", new[] { "-y", "", " notes-mcp " }, new[] { "KEY=a=b", "bad line" }, "", new string[0]);
+                var badEnv = form.ReadForTest() == null ? form.Problem : "";
+                form.TypeForTest("notes", true, "npx", new[] { "-y", "notes-mcp" }, new[] { "KEY=a=b", " MODE = fast " }, "", new string[0]);
+                var prog = form.ReadForTest();
+                form.TypeForTest("remote", false, "", new string[0], new string[0], "example.com/mcp", new string[0]);
+                var badUrl = form.ReadForTest() == null ? form.Problem : "";
+                form.TypeForTest("remote", false, "", new string[0], new string[0], "https://example.com/mcp", new[] { "Authorization: Bearer a:b" });
+                var remote = form.ReadForTest();
+                Check(taken.Contains("already") && badEnv.Contains("NAME=value") && badUrl.Contains("https://")
+                    && prog is { Command: "npx" } && prog.Args.SequenceEqual(new[] { "-y", "notes-mcp" }) && prog.Env["KEY"] == "a=b" && prog.Env["MODE"] == "fast"
+                    && remote is { Url: "https://example.com/mcp" } && remote.Headers["Authorization"] == "Bearer a:b" && remote.Command == "",
+                    "the add-server form reads a program and a web address, and points out a taken name, a bad environment line and a bad address");
+            }
               }
               catch (Exception ex) { P("FAIL exception in the window checks: " + ex.Message); fails++; }
             });

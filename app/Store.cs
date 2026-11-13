@@ -54,6 +54,7 @@ class Settings
     public int WindowWidth = 1000;
     public int WindowHeight = 720;
     public bool ToolsEnabled = true;     // the model may read the clock and use the project folder
+    public bool WebEnabled = true;       // the model may search the web and read pages
     public string Mode = "chat";         // "chat", or "code" = the model works in the project folder
     public string ProjectFolder = "";    // where the file tools work; empty = no file access
 
@@ -263,6 +264,7 @@ thinking_time_start=$ts, thinking_time_end=$te, attachments=$a, error=$e, tools=
         s.WindowHeight = I("window_height", s.WindowHeight);
         s.ToolsEnabled = B("tools_enabled", s.ToolsEnabled);
         s.ProjectFolder = T("project_folder", s.ProjectFolder);
+        s.WebEnabled = B("web_enabled", s.WebEnabled);
         s.Mode = T("mode", s.Mode) == "code" ? "code" : "chat";
         return s;
     }
@@ -284,6 +286,7 @@ thinking_time_start=$ts, thinking_time_end=$te, attachments=$a, error=$e, tools=
         P("window_height", s.WindowHeight.ToString());
         P("tools_enabled", B(s.ToolsEnabled));
         P("project_folder", s.ProjectFolder);
+        P("web_enabled", B(s.WebEnabled));
         P("mode", s.Mode);
     }
 

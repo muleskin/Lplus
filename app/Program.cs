@@ -14,11 +14,18 @@ static class Program
             if (EventWaitHandle.TryOpenExisting(@"Local\Lplus.Quit", out var q)) q.Set();
             return 0;
         }
+        if (args.Contains("--mcp-test-server")) return McpTestServer.RunStdio();
+        int mc = Array.IndexOf(args, "--mcp-check");
+        if (mc >= 0 && mc + 1 < args.Length)
+        {
+            Log.Enabled = false;
+            return SelfTest.McpCheck(args[mc + 1]).GetAwaiter().GetResult();
+        }
         int tr = Array.IndexOf(args, "--toolrun");
         if (tr >= 0 && tr + 4 < args.Length)
         {
             Log.Enabled = false;
-            return SelfTest.ToolRun(args[tr + 1], args[tr + 2], args[tr + 3], args[tr + 4]).GetAwaiter().GetResult();
+            return SelfTest.ToolRun(args[tr + 1], args[tr + 2], args[tr + 3], args[tr + 4], tr + 5 < args.Length && args[tr + 5] == "apply").GetAwaiter().GetResult();
         }
         int st = Array.IndexOf(args, "--selftest");
         if (st >= 0 && st + 1 < args.Length)

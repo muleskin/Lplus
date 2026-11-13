@@ -10,6 +10,7 @@ sealed class MainForm : Form
     Settings _settings;
     readonly ServerClient _client = new();
     readonly ServerManager _server;
+    readonly McpHub _mcp = new();
     readonly string? _screenshot;
 
     readonly Sidebar _sidebar = new() { Dock = DockStyle.Left };
@@ -19,6 +20,7 @@ sealed class MainForm : Form
     readonly Panel _bottom = new() { Dock = DockStyle.Bottom, BackColor = Theme.Background };
     readonly Composer _composer = new();
     readonly SettingsView _settingsView = new() { Dock = DockStyle.Fill, Visible = false };
+    readonly McpView _mcpView;
     readonly ModelPicker _picker = new();
     readonly StatusBar _status = new() { Dock = DockStyle.Bottom };
     readonly System.Windows.Forms.Timer _gpuTimer = new() { Interval = 3000 };
@@ -47,6 +49,7 @@ sealed class MainForm : Form
         _screenshot = screenshot;
         _settings = store.LoadSettings();
         _server = new ServerManager(_client, _settings);
+        _mcpView = new McpView(_mcp) { Dock = DockStyle.Fill, Visible = false };
 
         Text = "Lplus";
         Icon = Theme.MakeIcon(32);
@@ -63,6 +66,7 @@ sealed class MainForm : Form
         _chatPage.Controls.Add(_banner);
         _content.Controls.Add(_chatPage);
         _content.Controls.Add(_settingsView);
+        _content.Controls.Add(_mcpView);
         Controls.Add(_content);
         Controls.Add(_sidebar);
         Controls.Add(_status); // added last so it spans the whole width under the sidebar too
@@ -93,6 +97,9 @@ sealed class MainForm : Form
         };
         _settingsView.Changed += s => _ = ApplySettings(s);
         _settingsView.ViewLogs += ViewLogs;
+        _settingsView.ManageMcp += ShowMcpPage;
+        _sidebar.OpenMcp += ShowMcpPage;
+        _mcpView.Changed += ShowMcp;
 
         _uiTimer.Tick += (_, _) => { if (_dirty != null) { var m = _dirty; _dirty = null; _chat.Refresh(m); } };
         _uiTimer.Start();
@@ -143,13 +150,45 @@ sealed class MainForm : Form
             _ = PollGpu();
             // Test views for checking the layout (never saved): LPLUS_SHOT_PAGE=settings or demo.
             var page = Environment.GetEnvironmentVariable("LPLUS_SHOT_PAGE");
-            if (page == "settings") ShowSettings();
+            if (page == "settings")
+            {
+                ShowSettings();
+                // For checking the lower part of the page: scroll down and show sample server lines.
+                if (int.TryParse(Environment.GetEnvironmentVariable("LPLUS_SHOT_SCROLL"), out var down))
+                {
+                    _settingsView.McpLines = new() { ("files", "11 tools", true), ("search", "not working: it did not answer in time", false) };
+                    _settingsView.ScrollTo(down);
+                }
+            }
+            else if (page == "mcp")
+            {
+                // Sample servers and search results, for checking the page's layout.
+                _mcp.Configs.Add(new McpServerConfig { Name = "files", Command = "npx", Args = { "-y", "@modelcontextprotocol/server-filesystem", @"D:\Notes" } });
+                _mcp.Configs.Add(new McpServerConfig { Name = "tickets", Url = "https://example.com/mcp", Disabled = true });
+                _mcpView.ShowSample(McpRegistry.Parse("{\"servers\":[{\"server\":{\"name\":\"io.example/weather\",\"description\":\"Forecasts and current conditions for any city, from a public weather service.\",\"version\":\"1.2.0\",\"repository\":{\"url\":\"https://example.com/weather\"},\"packages\":[{\"registryType\":\"npm\",\"identifier\":\"weather-mcp\",\"transport\":{\"type\":\"stdio\"}}]}},{\"server\":{\"name\":\"io.example/notes\",\"description\":\"Read and search your notes.\",\"version\":\"0.4.1\",\"remotes\":[{\"type\":\"streamable-http\",\"url\":\"https://example.com/notes/mcp\"}]}}]}"), "example");
+                ShowMcpPage();
+                // The add/edit form too, saved as its own picture.
+                if (Environment.GetEnvironmentVariable("LPLUS_SHOT_DIALOG") is { Length: > 0 } dialogShot)
+                {
+                    var sample = new McpServerConfig { Name = "weather", Command = "npx", Args = { "-y", "weather-mcp" }, Env = { ["WEATHER_API_KEY"] = "" } };
+                    using var dlg = new McpServerDialog(sample, new List<string>(), isNew: true, notes: new List<string> { "WEATHER_API_KEY (required): Your key for the weather service." });
+                    dlg.StartPosition = FormStartPosition.Manual;
+                    dlg.Location = new Point(-4000, -4000);   // off screen: only the picture is wanted
+                    dlg.Show();
+                    Application.DoEvents();
+                    using var bmp = new Bitmap(dlg.Width, dlg.Height);
+                    dlg.DrawToBitmap(bmp, new Rectangle(0, 0, dlg.Width, dlg.Height));
+                    bmp.Save(dialogShot, System.Drawing.Imaging.ImageFormat.Png);
+                    dlg.Close();
+                }
+            }
             else if (page == "demo") { ShowDemo(); if (Environment.GetEnvironmentVariable("LPLUS_SHOT_SELECT") == "1") _chat.SelectAll(); }
             return;
         }
         _composer.FocusBox();
         _server.StateChanged += () => BeginInvoke(UpdateServerState);
         UpdateServerState();
+        _ = LoadMcp();
         await _server.Start();
         await LoadModels();
         _ = PollGpu();
@@ -222,6 +261,7 @@ sealed class MainForm : Form
     {
         _cts?.Cancel();
         if (_tray != null) { _tray.Visible = false; _tray.Dispose(); }
+        _mcp.Dispose();
         _server.Dispose();
         base.OnFormClosed(e);
     }
@@ -432,8 +472,20 @@ sealed class MainForm : Form
         _bottom.Invalidate();
     }
 
+    void ShowMcpPage()
+    {
+        _mcpView.Visible = true;
+        _settingsView.Visible = false;
+        _chatPage.Visible = false;
+        _sidebar.McpSelected = true;
+        _sidebar.SettingsSelected = false;
+        _sidebar.Invalidate();
+    }
+
     void ShowChatPage()
     {
+        _mcpView.Visible = false;
+        _sidebar.McpSelected = false;
         _settingsView.Visible = false;
         _chatPage.Visible = true;
         _sidebar.SettingsSelected = false;
@@ -444,6 +496,9 @@ sealed class MainForm : Form
     void ShowSettings()
     {
         _settingsView.Load(_settings);
+        _mcpView.Visible = false;
+        _sidebar.McpSelected = false;
+        ShowMcp();
         _settingsView.Visible = true;
         _chatPage.Visible = false;
         _sidebar.SettingsSelected = true;
@@ -594,11 +649,87 @@ sealed class MainForm : Form
         await Reply(chatId, model);
     }
 
+    static string Shorten(string s) => s.Length > 160 ? s[..160] + "…" : s;
+
+    // ---------- MCP servers ----------
+
+    /// <summary>Starts (or restarts) the servers in mcp.json and shows how each one is doing in Settings.</summary>
+    async Task LoadMcp()
+    {
+        if (_mcp.Loading) return;
+        var loading = _mcp.Load(Paths.McpConfig);
+        ShowMcp();
+        try { await loading; } catch (Exception ex) { Log.Warn("mcp: " + ex.Message); }
+        if (IsDisposed) return;
+        ShowMcp();
+        foreach (var s in _mcp.Servers)
+            Log.Info(s.Ready ? $"mcp server {s.Config.Name}: {s.Tools.Count} tools" : $"mcp server {s.Config.Name} failed: {s.Error}");
+    }
+
+    void ShowMcp()
+    {
+        _settingsView.McpLines = _mcp.Status();
+        _settingsView.McpNote = _mcp.ConfigError;
+        _settingsView.Invalidate();
+    }
+
+    // Server tools the person said need not be asked about again, until Lplus is closed.
+    readonly HashSet<string> _allowedMcp = new();
+
+    /// <summary>Asks before a model uses a tool from an MCP server.</summary>
+    bool ConfirmMcp(McpTool tool, JsonNode? args)
+    {
+        if (_allowedMcp.Contains(tool.Exposed)) return true;
+        var allow = new TaskDialogButton("Allow");
+        var no = new TaskDialogButton("Don't allow");
+        var sent = args?.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }) ?? "{}";
+        var page = new TaskDialogPage
+        {
+            Caption = "Lplus",
+            Heading = $"The model wants to use \"{tool.Name}\" from {tool.Server.Config.Name}",
+            Text = (tool.Description.Length > 0 ? Shorten(tool.Description) + "\n\n" : "") + "It will send:\n" + (sent.Length > 1200 ? sent[..1200] + "…" : sent),
+            Icon = TaskDialogIcon.Information,
+            Buttons = { allow, no },
+            DefaultButton = no,
+            Verification = new TaskDialogVerificationCheckBox("Don't ask again for this tool"),
+            AllowCancel = true,
+        };
+        bool ok = TaskDialog.ShowDialog(this, page) == allow;
+        if (ok && page.Verification.Checked) _allowedMcp.Add(tool.Exposed);
+        return ok;
+    }
+
+    // Commands the person said need not be asked about again, until Lplus is closed: "folder|command".
+    readonly HashSet<string> _allowedCommands = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Asks before a model runs a command in the project folder.</summary>
+    Task<bool> ConfirmCommand(string command, string folder)
+    {
+        var key = folder + "|" + command;
+        if (_allowedCommands.Contains(key)) return Task.FromResult(true);
+        var run = new TaskDialogButton("Run");
+        var no = new TaskDialogButton("Don't run");
+        var page = new TaskDialogPage
+        {
+            Caption = "Lplus",
+            Heading = "The model wants to run this command",
+            Text = command + "\n\nin " + folder,
+            Icon = TaskDialogIcon.Warning,
+            Buttons = { run, no },
+            DefaultButton = no,
+            Verification = new TaskDialogVerificationCheckBox("Don't ask again for this exact command"),
+            AllowCancel = true,
+        };
+        bool ok = TaskDialog.ShowDialog(this, page) == run;
+        if (ok && page.Verification.Checked) _allowedCommands.Add(key);
+        return Task.FromResult(ok);
+    }
+
     /// <summary>Asks before a model creates or replaces a file in the project folder.</summary>
     Task<bool> ConfirmWrite(string file, bool exists)
     {
         var ask = exists
-            ? $"The model wants to replace this file:\n\n{file}\n\nReplace it?"
+            ? $"The model wants to change this file:\n\n{file}\n\nChange it?"
             : $"The model wants to create this file:\n\n{file}\n\nCreate it?";
         return Task.FromResult(MessageBox.Show(this, ask, "Lplus", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes);
     }
@@ -663,19 +794,36 @@ sealed class MainForm : Form
             // What the model may do on this PC: models that can call tools get the clock and the project
             // folder; the others are simply told the time.
             JsonArray? tools = null;
-            var folder = _settings.Mode == "code" ? _settings.ProjectFolder : "";   // files only in Code mode
+            var folder = _settings.Mode == "code" ? _settings.ProjectFolder : "";   // files and commands only in Code mode
+            bool web = _settings.WebEnabled;
             if (_settings.ToolsEnabled)
             {
-                if (_caps.Contains("tools")) tools = Tools.Definitions(folder);
-                msgs.Insert(0, new JsonObject { ["role"] = "system", ["content"] = Tools.SystemNote(tools != null, folder) });
+                if (_caps.Contains("tools")) tools = Tools.Definitions(folder, web);
+                var note = Tools.SystemNote(tools != null, folder, web);
+                if (tools != null && _mcp.Tools.Count > 0)
+                {
+                    // Tools from the person's MCP servers, in both modes.
+                    foreach (var d in _mcp.Definitions()) tools.Add(d?.DeepClone());
+                    note += " More tools come from the user's own servers (" + string.Join(", ", _mcp.Servers.Where(s => s.Ready).Select(s => s.Config.Name))
+                        + "); use them when they fit the request.";
+                }
+                msgs.Insert(0, new JsonObject { ["role"] = "system", ["content"] = note });
             }
 
             async Task<string> RunTool(string name, JsonNode? args)
             {
-                var result = await Tools.Run(name, args, folder, ConfirmWrite);
-                bool declined = name == "write_file" && result.StartsWith("The user declined");
-                bot.Tools.Add(result.StartsWith("Error:") ? $"{Tools.Describe(name, args)} — {result[7..].TrimEnd('.')}"
-                    : declined ? $"Did not save {args?["path"]} (you said no)" : Tools.Describe(name, args));
+                // Shown while a slow step (a build, a web page) is still running, then replaced by how it went.
+                var mcpTool = _mcp.Find(name);
+                var did = mcpTool != null ? $"Used {mcpTool.Server.Config.Name}: {mcpTool.Name}" : Tools.Describe(name, args);
+                bot.Tools.Add(did + " …");
+                int at = bot.Tools.Count - 1;
+                _dirty = bot;
+                var result = mcpTool == null ? await Tools.Run(name, args, folder, ConfirmWrite, web, ConfirmCommand)
+                    : ConfirmMcp(mcpTool, args) ? await mcpTool.Server.Call(mcpTool.Name, args) : Tools.Declined;
+                bot.Tools[at] = result.StartsWith("Error:") ? $"{did} — {Shorten(result[7..].TrimEnd('.'))}"
+                    : result == Tools.Declined ? $"Not done (you said no): {did}"
+                    : name == "run_command" ? $"{did} — {Shorten(result.Split('\n')[0].TrimEnd('.'))}"
+                    : did;
                 if (bot.Content.Length > 0 && !bot.Content.EndsWith("\n\n")) bot.Content += "\n\n";
                 _dirty = bot;
                 return result;

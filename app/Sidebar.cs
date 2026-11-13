@@ -23,10 +23,12 @@ sealed class Sidebar : Control
 
     public string? SelectedChatId;
     public bool SettingsSelected;
+    public bool McpSelected;
 
     public event Action? NewChat;
     public event Action<string>? OpenChat;
     public event Action? OpenSettings;
+    public event Action? OpenMcp;
     public event Action<string, string>? RenameChat;
     public event Action<string>? DeleteChat;
 
@@ -59,7 +61,7 @@ sealed class Sidebar : Control
 
     int RowH => Theme.S(36);
     int TopH => Theme.S(64);
-    int BottomH => Theme.S(56);
+    int BottomH => Theme.S(94);
 
     void Relayout()
     {
@@ -83,6 +85,8 @@ sealed class Sidebar : Control
         }
         _contentH = y;
         int by = Height - BottomH + Theme.S(10);
+        _fixed.Add(new Row { Kind = "mcp", Text = "MCP servers", R = new Rectangle(pad, by, Width - 2 * pad, RowH) });
+        by += RowH + Theme.S(2);
         _fixed.Add(new Row { Kind = "settings", Text = "Settings", R = new Rectangle(pad, by, Width - 2 * pad, RowH) });
         ClampScroll();
         Invalidate();
@@ -114,7 +118,7 @@ sealed class Sidebar : Control
                 Theme.DrawEllipsis(g, r.Text, Theme.SmallBold, Theme.Faint, new Rectangle(rr.X + Theme.S(10), rr.Y + Theme.S(6), rr.Width, rr.Height - Theme.S(6)));
                 continue;
             }
-            bool sel = r.Chat?.Id == SelectedChatId && !SettingsSelected;
+            bool sel = r.Chat?.Id == SelectedChatId && !SettingsSelected && !McpSelected;
             if (sel) Theme.FillRound(g, Theme.SidebarSelected, rr, Theme.S(8));
             else if (_hover == r) Theme.FillRound(g, Theme.SidebarHover, rr, Theme.S(8));
             Theme.DrawEllipsis(g, r.Text, Theme.Body, sel ? Theme.Text : Theme.TextBody, new Rectangle(rr.X + Theme.S(10), rr.Y, rr.Width - Theme.S(20), rr.Height));
@@ -125,11 +129,11 @@ sealed class Sidebar : Control
 
         foreach (var r in _fixed)
         {
-            bool sel = r.Kind == "settings" && SettingsSelected;
+            bool sel = (r.Kind == "settings" && SettingsSelected) || (r.Kind == "mcp" && McpSelected);
             if (sel) Theme.FillRound(g, Theme.SidebarSelected, r.R, Theme.S(8));
             else if (_hover == r) Theme.FillRound(g, Theme.SidebarHover, r.R, Theme.S(8));
             int ix = r.R.X + Theme.S(12), iy = r.R.Y + r.R.Height / 2;
-            if (r.Kind == "new") DrawCompose(g, ix, iy); else DrawGear(g, ix, iy);
+            if (r.Kind == "new") DrawCompose(g, ix, iy); else if (r.Kind == "mcp") DrawPlug(g, ix, iy); else DrawGear(g, ix, iy);
             var ts = Theme.Measure(r.Text, Theme.Body);
             Theme.Draw(g, r.Text, Theme.Body, Theme.Text, ix + Theme.S(26), iy - ts.Height / 2);
             if (r.Kind == "new")
@@ -149,6 +153,18 @@ sealed class Sidebar : Control
         float k = Theme.Sf(7);
         g.DrawLines(pen, new[] { new PointF(x + k * 0.3f, y - k), new PointF(x - k, y - k), new PointF(x - k, y + k), new PointF(x + k, y + k), new PointF(x + k, y - k * 0.3f) });
         g.DrawLine(pen, x - k * 0.2f, y + k * 0.2f, x + k * 1.1f, y - k * 1.1f);
+    }
+
+    /// <summary>The MCP servers icon: a plug.</summary>
+    static void DrawPlug(Graphics g, int x, int y)
+    {
+        using var pen = new Pen(Theme.TextBody, Theme.Sf(1.5f)) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round };
+        float k = Theme.Sf(4.5f);
+        // Two prongs, the body, and the cable.
+        g.DrawLine(pen, x - k / 2, y - k * 1.7f, x - k / 2, y - k * 0.7f);
+        g.DrawLine(pen, x + k / 2, y - k * 1.7f, x + k / 2, y - k * 0.7f);
+        using (var body = Theme.Round(new RectangleF(x - k, y - k * 0.7f, 2 * k, k * 1.5f), Theme.Sf(2f))) g.DrawPath(pen, body);
+        g.DrawLine(pen, x, y + k * 0.8f, x, y + k * 1.7f);
     }
 
     static void DrawGear(Graphics g, int x, int y)
@@ -213,6 +229,7 @@ sealed class Sidebar : Control
         {
             case "new": NewChat?.Invoke(); break;
             case "settings": OpenSettings?.Invoke(); break;
+            case "mcp": OpenMcp?.Invoke(); break;
             case "chat": OpenChat?.Invoke(r.Chat!.Id); break;
         }
     }
