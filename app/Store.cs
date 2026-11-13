@@ -23,6 +23,7 @@ class ChatMessage
     public DateTime? ThinkEnd { get; set; }
     public List<Attachment> Attachments { get; set; } = new();
     public string? Error { get; set; }
+    public List<string> Tools { get; set; } = new();  // what the model did on this PC for this reply
 
     // Live state, not stored.
     public bool Streaming;
@@ -52,6 +53,9 @@ class Settings
     public bool SidebarOpen = true;
     public int WindowWidth = 1000;
     public int WindowHeight = 720;
+    public bool ToolsEnabled = true;     // the model may read the clock and use the project folder
+    public string Mode = "chat";         // "chat", or "code" = the model works in the project folder
+    public string ProjectFolder = "";    // where the file tools work; empty = no file access
 
     public Settings Clone() => (Settings)MemberwiseClone();
 
@@ -85,6 +89,7 @@ CREATE TABLE IF NOT EXISTS messages (
   attachments TEXT NOT NULL DEFAULT '[]', error TEXT);
 CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);");
+        try { Exec("ALTER TABLE messages ADD COLUMN tools TEXT NOT NULL DEFAULT '[]'"); } catch (SqliteException) { /* already there */ }
     }
 
     void Exec(string sql, params (string, object?)[] args)
@@ -143,7 +148,7 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         lock (_gate)
         {
             using var cmd = _db.CreateCommand();
-            cmd.CommandText = "SELECT id, role, content, thinking, model, created_at, thinking_time_start, thinking_time_end, attachments, error FROM messages WHERE chat_id=$c ORDER BY id";
+            cmd.CommandText = "SELECT id, role, content, thinking, model, created_at, thinking_time_start, thinking_time_end, attachments, error, tools FROM messages WHERE chat_id=$c ORDER BY id";
             cmd.Parameters.AddWithValue("$c", chatId);
             using var r = cmd.ExecuteReader();
             while (r.Read())
@@ -157,6 +162,7 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                     Error = r.IsDBNull(9) ? null : r.GetString(9),
                 };
                 try { m.Attachments = JsonSerializer.Deserialize<List<Attachment>>(r.GetString(8)) ?? new(); } catch { }
+                try { m.Tools = JsonSerializer.Deserialize<List<string>>(r.GetString(10)) ?? new(); } catch { }
                 list.Add(m);
             }
         }
@@ -171,8 +177,8 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             lock (_gate)
             {
                 using var cmd = _db.CreateCommand();
-                cmd.CommandText = @"INSERT INTO messages(chat_id,role,content,thinking,model,created_at,thinking_time_start,thinking_time_end,attachments,error)
-VALUES($c,$r,$co,$th,$m,$cr,$ts,$te,$a,$e); SELECT last_insert_rowid();";
+                cmd.CommandText = @"INSERT INTO messages(chat_id,role,content,thinking,model,created_at,thinking_time_start,thinking_time_end,attachments,error,tools)
+VALUES($c,$r,$co,$th,$m,$cr,$ts,$te,$a,$e,$tl); SELECT last_insert_rowid();";
                 Bind(cmd, chatId, m, att);
                 m.Id = (long)cmd.ExecuteScalar()!;
             }
@@ -183,7 +189,7 @@ VALUES($c,$r,$co,$th,$m,$cr,$ts,$te,$a,$e); SELECT last_insert_rowid();";
             {
                 using var cmd = _db.CreateCommand();
                 cmd.CommandText = @"UPDATE messages SET role=$r, content=$co, thinking=$th, model=$m, created_at=$cr,
-thinking_time_start=$ts, thinking_time_end=$te, attachments=$a, error=$e WHERE id=$id AND chat_id=$c";
+thinking_time_start=$ts, thinking_time_end=$te, attachments=$a, error=$e, tools=$tl WHERE id=$id AND chat_id=$c";
                 Bind(cmd, chatId, m, att);
                 cmd.Parameters.AddWithValue("$id", m.Id);
                 cmd.ExecuteNonQuery();
@@ -204,6 +210,26 @@ thinking_time_start=$ts, thinking_time_end=$te, attachments=$a, error=$e WHERE i
         cmd.Parameters.AddWithValue("$te", m.ThinkEnd.HasValue ? Ts(m.ThinkEnd.Value) : DBNull.Value);
         cmd.Parameters.AddWithValue("$a", att);
         cmd.Parameters.AddWithValue("$e", (object?)m.Error ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$tl", JsonSerializer.Serialize(m.Tools));
+    }
+
+    /// <summary>What the person asked before, newest first, each prompt once (for the Up arrow in the message box).</summary>
+    public List<string> RecentPrompts(int max = 200)
+    {
+        var list = new List<string>();
+        var seen = new HashSet<string>();
+        lock (_gate)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT content FROM messages WHERE role='user' AND content<>'' ORDER BY id DESC LIMIT 1000";
+            using var r = cmd.ExecuteReader();
+            while (r.Read() && list.Count < max)
+            {
+                var text = r.GetString(0);
+                if (seen.Add(text)) list.Add(text);
+            }
+        }
+        return list;
     }
 
     public void DeleteMessagesFrom(string chatId, long fromId) =>
@@ -235,6 +261,9 @@ thinking_time_start=$ts, thinking_time_end=$te, attachments=$a, error=$e WHERE i
         s.SidebarOpen = B("sidebar_open", s.SidebarOpen);
         s.WindowWidth = I("window_width", s.WindowWidth);
         s.WindowHeight = I("window_height", s.WindowHeight);
+        s.ToolsEnabled = B("tools_enabled", s.ToolsEnabled);
+        s.ProjectFolder = T("project_folder", s.ProjectFolder);
+        s.Mode = T("mode", s.Mode) == "code" ? "code" : "chat";
         return s;
     }
 
@@ -253,6 +282,9 @@ thinking_time_start=$ts, thinking_time_end=$te, attachments=$a, error=$e WHERE i
         P("sidebar_open", B(s.SidebarOpen));
         P("window_width", s.WindowWidth.ToString());
         P("window_height", s.WindowHeight.ToString());
+        P("tools_enabled", B(s.ToolsEnabled));
+        P("project_folder", s.ProjectFolder);
+        P("mode", s.Mode);
     }
 
     public void Dispose() => _db.Dispose();

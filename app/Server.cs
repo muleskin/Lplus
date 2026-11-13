@@ -81,12 +81,17 @@ sealed class ServerClient
         return set;
     }
 
-    /// <summary>Streams /api/chat. onDelta(contentDelta, thinkingDelta).</summary>
-    public async Task Chat(string model, JsonArray messages, JsonNode? think,
-        Action<string, string> onDelta, CancellationToken ct)
+    /// <summary>
+    /// Streams /api/chat. onDelta(contentDelta, thinkingDelta). Returns the tool calls the model asked for
+    /// (empty when it just answered).
+    /// </summary>
+    public async Task<List<JsonNode>> Chat(string model, JsonArray messages, JsonNode? think,
+        Action<string, string> onDelta, CancellationToken ct, JsonArray? tools = null)
     {
-        var body = new JsonObject { ["model"] = model, ["messages"] = messages, ["stream"] = true };
-        if (think != null) body["think"] = think;
+        var calls = new List<JsonNode>();
+        var body = new JsonObject { ["model"] = model, ["messages"] = messages.DeepClone(), ["stream"] = true };
+        if (think != null) body["think"] = think.DeepClone();
+        if (tools is { Count: > 0 }) body["tools"] = tools.DeepClone();
         await Stream("/api/chat", body, line =>
         {
             var err = line["error"]?.GetValue<string>();
@@ -95,7 +100,10 @@ sealed class ServerClient
             var c = msg?["content"]?.GetValue<string>() ?? "";
             var t = msg?["thinking"]?.GetValue<string>() ?? "";
             if (c.Length > 0 || t.Length > 0) onDelta(c, t);
+            if (msg?["tool_calls"] is JsonArray tc)
+                foreach (var call in tc) if (call != null) calls.Add(call.DeepClone());
         }, ct);
+        return calls;
     }
 
     /// <summary>Streams /api/pull (downloading a model). onProgress(status, completed, total).</summary>

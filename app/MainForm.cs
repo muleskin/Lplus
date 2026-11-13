@@ -71,7 +71,9 @@ sealed class MainForm : Form
         _composer.HeightChanged += LayoutChatPage;
         _composer.SendClicked += () => _ = Send();
         _composer.StopClicked += () => _cts?.Cancel();
-        _composer.AttachClicked += PickFiles;
+        _composer.AttachClicked += () => { if (_composer.CodeMode) PickProjectFolder(); else PickFiles(); };
+        _composer.ModeClicked += SetMode;
+        _composer.History = () => _store.RecentPrompts();
         _composer.ModelClicked += p => _ = OpenPicker(p);
         _composer.ThinkClicked += ThinkMenu;
         _composer.CancelEdit += CancelEdit;
@@ -100,6 +102,8 @@ sealed class MainForm : Form
         ReloadSidebar();
         NewChat();
         _composer.ModelName = _settings.SelectedModel;
+        _composer.CodeMode = _settings.Mode == "code";
+        _composer.ProjectFolder = _settings.ProjectFolder;
         _composer.Sync();
     }
 
@@ -140,7 +144,7 @@ sealed class MainForm : Form
             // Test views for checking the layout (never saved): LPLUS_SHOT_PAGE=settings or demo.
             var page = Environment.GetEnvironmentVariable("LPLUS_SHOT_PAGE");
             if (page == "settings") ShowSettings();
-            else if (page == "demo") ShowDemo();
+            else if (page == "demo") { ShowDemo(); if (Environment.GetEnvironmentVariable("LPLUS_SHOT_SELECT") == "1") _chat.SelectAll(); }
             return;
         }
         _composer.FocusBox();
@@ -225,6 +229,8 @@ sealed class MainForm : Form
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
         if (keyData == (Keys.Control | Keys.N)) { NewChat(); return true; }
+        // Ctrl+C copies text selected in the conversation, unless text is selected in the message box.
+        if (keyData == (Keys.Control | Keys.C) && _chatPage.Visible && _chat.HasSelection && !_composer.HasTextSelection && _chat.CopySelection()) return true;
         if (keyData == (Keys.Control | Keys.Oemcomma)) { ShowSettings(); return true; }
         return base.ProcessCmdKey(ref msg, keyData);
     }
@@ -309,9 +315,12 @@ sealed class MainForm : Form
         s.ThinkLevel = _settings.ThinkLevel;
         s.WindowWidth = _settings.WindowWidth;
         s.WindowHeight = _settings.WindowHeight;
+        s.Mode = _settings.Mode;
         bool serverChange = _settings.ServerDiffers(s);
         _settings = s;
         _store.SaveSettings(_settings);
+        _composer.ProjectFolder = _settings.ProjectFolder;
+        _composer.Sync();
         if (!serverChange || _screenshot != null) return;
         if (_cts != null) { _settingsView.ApplyNote = "Changes will apply after the current reply finishes and the model server restarts."; }
         var ok = await _server.Apply(_settings);
@@ -483,6 +492,30 @@ sealed class MainForm : Form
         if (dlg.ShowDialog(this) == DialogResult.OK) _composer.AddFiles(dlg.FileNames);
     }
 
+    /// <summary>Chat mode or Code mode (the switch in the message box).</summary>
+    void SetMode(bool code)
+    {
+        if (code == (_settings.Mode == "code")) return;
+        _settings.Mode = code ? "code" : "chat";
+        if (_screenshot == null) _store.SaveSettings(_settings);
+        _composer.CodeMode = code;
+        _composer.Sync();
+        _composer.FocusBox();
+    }
+
+    /// <summary>Code mode's "+": choose the folder the model works in.</summary>
+    bool PickProjectFolder()
+    {
+        using var dlg = new FolderBrowserDialog { Description = "Project folder the model may work in", UseDescriptionForTitle = true };
+        if (Tools.HasFolder(_settings.ProjectFolder)) dlg.InitialDirectory = _settings.ProjectFolder;
+        if (dlg.ShowDialog(this) != DialogResult.OK) return false;
+        _settings.ProjectFolder = dlg.SelectedPath;
+        _store.SaveSettings(_settings);
+        _composer.ProjectFolder = _settings.ProjectFolder;
+        _composer.Sync();
+        return true;
+    }
+
     void BeginEdit(ChatMessage m)
     {
         _editing = m;
@@ -513,6 +546,20 @@ sealed class MainForm : Form
         {
             MessageBox.Show(this, "Pick a model first (the button next to send).", "Lplus");
             return;
+        }
+        if (_settings.Mode == "code")
+        {
+            if (!_settings.ToolsEnabled)
+            {
+                MessageBox.Show(this, "Code mode needs Tools turned on in Settings.", "Lplus");
+                return;
+            }
+            if (_caps.Count > 0 && !_caps.Contains("tools"))
+            {
+                MessageBox.Show(this, "This model cannot use tools, so it cannot see your project. Pick another model for Code mode.", "Lplus");
+                return;
+            }
+            if (!Tools.HasFolder(_settings.ProjectFolder) && !PickProjectFolder()) return;
         }
         if (_composer.Attachments.Any(a => a.Kind == "image") && _caps.Count > 0 && !_caps.Contains("vision"))
         {
@@ -545,6 +592,15 @@ sealed class MainForm : Form
         _chat.Messages.Add(user);
         _composer.ClearInput();
         await Reply(chatId, model);
+    }
+
+    /// <summary>Asks before a model creates or replaces a file in the project folder.</summary>
+    Task<bool> ConfirmWrite(string file, bool exists)
+    {
+        var ask = exists
+            ? $"The model wants to replace this file:\n\n{file}\n\nReplace it?"
+            : $"The model wants to create this file:\n\n{file}\n\nCreate it?";
+        return Task.FromResult(MessageBox.Show(this, ask, "Lplus", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes);
     }
 
     async Task Retry(ChatMessage failed)
@@ -604,7 +660,28 @@ sealed class MainForm : Form
             if (_caps.Contains("thinking"))
                 think = LevelModel(model) ? JsonValue.Create(_settings.ThinkLevel) : JsonValue.Create(_settings.ThinkEnabled);
 
-            await _client.Chat(model, msgs, think, (c, t) =>
+            // What the model may do on this PC: models that can call tools get the clock and the project
+            // folder; the others are simply told the time.
+            JsonArray? tools = null;
+            var folder = _settings.Mode == "code" ? _settings.ProjectFolder : "";   // files only in Code mode
+            if (_settings.ToolsEnabled)
+            {
+                if (_caps.Contains("tools")) tools = Tools.Definitions(folder);
+                msgs.Insert(0, new JsonObject { ["role"] = "system", ["content"] = Tools.SystemNote(tools != null, folder) });
+            }
+
+            async Task<string> RunTool(string name, JsonNode? args)
+            {
+                var result = await Tools.Run(name, args, folder, ConfirmWrite);
+                bool declined = name == "write_file" && result.StartsWith("The user declined");
+                bot.Tools.Add(result.StartsWith("Error:") ? $"{Tools.Describe(name, args)} — {result[7..].TrimEnd('.')}"
+                    : declined ? $"Did not save {args?["path"]} (you said no)" : Tools.Describe(name, args));
+                if (bot.Content.Length > 0 && !bot.Content.EndsWith("\n\n")) bot.Content += "\n\n";
+                _dirty = bot;
+                return result;
+            }
+
+            await Tools.Converse(_client, model, msgs, think, tools, RunTool, (c, t) =>
             {
                 if (t.Length > 0)
                 {

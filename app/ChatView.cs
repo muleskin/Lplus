@@ -10,6 +10,8 @@ sealed class ChatView : ScrollableControl
         public Font Font = Theme.Body;
         public Color Color;
         public bool InlineCode;
+        public bool Ui;        // a label or button of the app (Copy, Retry...), not part of the conversation's text
+        public string? Join;   // how this joins the text before it when copied: null = by position, " " or "" = same line continued
     }
 
     sealed class Box
@@ -47,6 +49,10 @@ sealed class ChatView : ScrollableControl
     readonly System.Windows.Forms.Timer _anim = new() { Interval = 400 };
     int _dots;
 
+    // Text selected with the mouse: from one place (message, fragment, character) to another.
+    (ChatMessage m, int frag, int ch)? _selFrom, _selTo;
+    bool _selecting;
+
     public event Action<ChatMessage>? EditRequested;
     public event Action<ChatMessage>? RetryRequested;
 
@@ -70,6 +76,7 @@ sealed class ChatView : ScrollableControl
     public void SetMessages(List<ChatMessage> msgs)
     {
         Messages = msgs;
+        _selFrom = _selTo = null;
         _cache.Clear();
         Relayout();
         ScrollToBottom();
@@ -134,6 +141,7 @@ sealed class ChatView : ScrollableControl
         int lh = LineHeight(baseFont);
         int x = x0;
         bool any = false;
+        string? join = null;   // set when the next fragment only continues a wrapped line
         foreach (var run in runs)
         {
             var font = F(baseFont, run.Style);
@@ -146,7 +154,7 @@ sealed class ChatView : ScrollableControl
                 var bare = word.TrimEnd();
                 int bareW = bare.Length == 0 ? 0 : Theme.Measure(bare, font).Width;
                 int fullW = Theme.Measure(word.Replace(' ', ' '), font).Width;
-                if (x > x0 && x + bareW > x0 + width) { y += lh; x = x0; if (bare.Length == 0) continue; }
+                if (x > x0 && x + bareW > x0 + width) { y += lh; x = x0; join = " "; if (bare.Length == 0) continue; }
                 if (bareW > width)
                 {
                     // A very long word: break it by characters.
@@ -155,7 +163,7 @@ sealed class ChatView : ScrollableControl
                     {
                         if (Theme.Measure(part + ch, font).Width > x0 + width - x && part.Length > 0)
                         {
-                            Add(part); y += lh; x = x0; part = "";
+                            Add(part); y += lh; x = x0; part = ""; join = "";
                         }
                         part += ch;
                     }
@@ -173,8 +181,9 @@ sealed class ChatView : ScrollableControl
                     l.Frags.Add(new Frag
                     {
                         X = x, Y = y + (lh - sz.Height) / 2, W = sz.Width, H = sz.Height, Text = t, Font = font, Color = col,
-                        InlineCode = run.Style == Span.Code,
+                        InlineCode = run.Style == Span.Code, Join = join,
                     });
+                    join = null;
                     any = true;
                 }
             }
@@ -186,7 +195,7 @@ sealed class ChatView : ScrollableControl
     {
         int W = ColumnWidth;
         bool thinkOpen = m.ThinkingOpen || (m.Streaming && m.Content.Length == 0 && m.Thinking.Length > 0);
-        var key = $"{W}|{m.Content.Length}|{m.Thinking.Length}|{thinkOpen}|{m.Streaming}|{m.DownloadStatus}|{m.DownloadDone}|{m.Error}|{m.Attachments.Count}|{(_copied == m ? 1 : 0)}|{_copiedCode}";
+        var key = $"{W}|{m.Content.Length}|{m.Thinking.Length}|{thinkOpen}|{m.Streaming}|{m.DownloadStatus}|{m.DownloadDone}|{m.Error}|{m.Attachments.Count}|{m.Tools.Count}|{(_copied == m ? 1 : 0)}|{_copiedCode}";
         if (_cache.TryGetValue(m, out var cached) && cached.Key == key) return cached;
         var l = new Laid { Key = key };
         int y = 0;
@@ -234,11 +243,11 @@ sealed class ChatView : ScrollableControl
         {
             int bh = Theme.S(76);
             l.Boxes.Add(new Box { R = new Rectangle(0, y, W, bh), Fill = Color.White, Stroke = Theme.Border, Radius = Theme.S(12) });
-            AddText(l, "Downloading model", Theme.BodyBold, Theme.Text, Theme.S(16), y + Theme.S(12));
+            AddText(l, "Downloading model", Theme.BodyBold, Theme.Text, Theme.S(16), y + Theme.S(12), ui: true);
             var detail = m.DownloadTotal > 0
                 ? $"{Bytes(m.DownloadDone)} / {Bytes(m.DownloadTotal)} ({Math.Floor(100.0 * m.DownloadDone / m.DownloadTotal)}%)"
                 : m.DownloadStatus;
-            AddText(l, detail, Theme.Small, Theme.Muted, Theme.S(16), y + Theme.S(36));
+            AddText(l, detail, Theme.Small, Theme.Muted, Theme.S(16), y + Theme.S(36), ui: true);
             float frac = m.DownloadTotal > 0 ? (float)m.DownloadDone / m.DownloadTotal : 0f;
             l.Boxes.Add(new Box { R = new Rectangle(Theme.S(16), y + bh - Theme.S(16), W - Theme.S(32), Theme.S(4)), Fill = Theme.Border, Radius = Theme.S(2), Progress = frac });
             y += bh + Theme.S(12);
@@ -256,9 +265,9 @@ sealed class ChatView : ScrollableControl
             else head = "Thinking...";
             var chevron = thinkOpen ? "⌄" : "›";
             int lh = LineHeight(Theme.Body);
-            AddText(l, chevron, Theme.Body, Theme.Muted, Theme.S(2), y + (thinkOpen ? -Theme.S(4) : 0));
+            AddText(l, chevron, Theme.Body, Theme.Muted, Theme.S(2), y + (thinkOpen ? -Theme.S(4) : 0), ui: true);
             var hs = Theme.Measure(head, Theme.Body);
-            AddText(l, head, Theme.Body, Theme.Muted, Theme.S(22), y + (lh - hs.Height) / 2);
+            AddText(l, head, Theme.Body, Theme.Muted, Theme.S(22), y + (lh - hs.Height) / 2, ui: true);
             l.Hits.Add(new Hit { R = new Rectangle(0, y, hs.Width + Theme.S(26), lh), Act = () => { m.ThinkingOpen = !thinkOpen; Refresh(m); } });
             y += lh;
             if (thinkOpen)
@@ -277,10 +286,18 @@ sealed class ChatView : ScrollableControl
             else y += Theme.S(8);
         }
 
+        // What the model did on this PC for this reply (clock, project files), one muted line each.
+        if (m.Tools.Count > 0)
+        {
+            foreach (var step in m.Tools)
+                y = Flow(l, new List<Run> { new("✓  " + step, Span.Normal) }, Theme.Small, Theme.Muted, Theme.S(2), W - Theme.S(2), y);
+            y += Theme.S(8);
+        }
+
         if (m.Content.Length > 0) y = LayoutMarkdown(l, m.Content, W, y);
         else if (m.Streaming && m.DownloadStatus == null && !(m.Thinking.Length > 0))
         {
-            AddText(l, new string('●', 1) + new string('●', Math.Max(0, _dots % 3)), Theme.Small, Theme.Faint, 0, y + Theme.S(4));
+            AddText(l, new string('●', 1) + new string('●', Math.Max(0, _dots % 3)), Theme.Small, Theme.Faint, 0, y + Theme.S(4), ui: true);
             y += LineHeight(Theme.Body);
         }
 
@@ -293,7 +310,7 @@ sealed class ChatView : ScrollableControl
             y += ey + Theme.S(18);
             var retry = "Retry";
             var rs = Theme.Measure(retry, Theme.Small);
-            AddText(l, retry, Theme.Small, Theme.Muted, 0, y);
+            AddText(l, retry, Theme.Small, Theme.Muted, 0, y, ui: true);
             l.Hits.Add(new Hit { R = new Rectangle(0, y - 2, rs.Width + 4, rs.Height + 4), Act = () => RetryRequested?.Invoke(m) });
             y += rs.Height + Theme.S(4);
         }
@@ -303,14 +320,14 @@ sealed class ChatView : ScrollableControl
             y += Theme.S(6);
             var copy = _copied == m ? "Copied!" : "Copy";
             var cs = Theme.Measure(copy, Theme.Small);
-            AddText(l, copy, Theme.Small, Theme.Faint, 0, y);
+            AddText(l, copy, Theme.Small, Theme.Faint, 0, y, ui: true);
             l.Hits.Add(new Hit
             {
                 R = new Rectangle(-2, y - 2, cs.Width + 6, cs.Height + 4),
                 Act = () => { CopyText(m.Content); _copied = m; _copiedAt = DateTime.Now; Refresh(m); }
             });
             if (!string.IsNullOrEmpty(m.Model))
-                AddText(l, m.Model, Theme.Small, Theme.Faint, cs.Width + Theme.S(16), y);
+                AddText(l, m.Model, Theme.Small, Theme.Faint, cs.Width + Theme.S(16), y, ui: true);
             y += cs.Height;
         }
 
@@ -374,6 +391,7 @@ sealed class ChatView : ScrollableControl
         foreach (var raw in b.Code.Replace("\t", "    ").Split('\n'))
         {
             var line = raw;
+            bool cut = false;
             do
             {
                 var part = line.Length > perLine ? line[..perLine] : line;
@@ -381,8 +399,9 @@ sealed class ChatView : ScrollableControl
                 if (part.Length > 0)
                 {
                     var sz = Theme.Measure(part, Theme.Mono);
-                    frags.Add(new Frag { X = pad, Y = ty, W = sz.Width, H = sz.Height, Text = part, Font = Theme.Mono, Color = Theme.Text });
+                    frags.Add(new Frag { X = pad, Y = ty, W = sz.Width, H = sz.Height, Text = part, Font = Theme.Mono, Color = Theme.Text, Join = cut ? "" : null });
                 }
+                cut = true;
                 ty += lh;
             } while (line.Length > 0);
         }
@@ -390,11 +409,11 @@ sealed class ChatView : ScrollableControl
         l.Boxes.Add(new Box { R = new Rectangle(0, top, W, h), Fill = Theme.CodeBg, Radius = Theme.S(12) });
         if (isCode)
         {
-            AddText(l, string.IsNullOrEmpty(b.Lang) ? "code" : b.Lang, Theme.Small, Theme.Muted, pad, top + Theme.S(8));
+            AddText(l, string.IsNullOrEmpty(b.Lang) ? "code" : b.Lang, Theme.Small, Theme.Muted, pad, top + Theme.S(8), ui: true);
             var code = b.Code;
             var label = _copiedCode == code ? "Copied!" : "Copy";
             var cs = Theme.Measure(label, Theme.Small);
-            AddText(l, label, Theme.Small, Theme.Muted, W - pad - cs.Width, top + Theme.S(8));
+            AddText(l, label, Theme.Small, Theme.Muted, W - pad - cs.Width, top + Theme.S(8), ui: true);
             l.Hits.Add(new Hit
             {
                 R = new Rectangle(W - pad - cs.Width - 4, top + Theme.S(6), cs.Width + 8, cs.Height + 4),
@@ -409,10 +428,10 @@ sealed class ChatView : ScrollableControl
         return top + h;
     }
 
-    static void AddText(Laid l, string text, Font f, Color c, int x, int y)
+    static void AddText(Laid l, string text, Font f, Color c, int x, int y, bool ui = false)
     {
         var sz = Theme.Measure(text, f);
-        l.Frags.Add(new Frag { X = x, Y = y, W = sz.Width, H = sz.Height, Text = text, Font = f, Color = c });
+        l.Frags.Add(new Frag { X = x, Y = y, W = sz.Width, H = sz.Height, Text = text, Font = f, Color = c, Ui = ui });
     }
 
     static string Bytes(long b)
@@ -451,10 +470,21 @@ sealed class ChatView : ScrollableControl
                 using var pen = new Pen(c, Math.Max(1f, Theme.Sf(2f)));
                 g.DrawLine(pen, a.X + ox, a.Y + baseY, b2.X + ox, b2.Y + baseY);
             }
-            foreach (var f in l.Frags)
+            for (int fi = 0; fi < l.Frags.Count; fi++)
             {
+                var f = l.Frags[fi];
                 if (f.InlineCode)
                     Theme.FillRound(g, Theme.InlineCodeBg, new RectangleF(f.X + ox - 3, f.Y + baseY - 1, f.W + 6, f.H + 2), 4);
+                if (SelectedPart(m, l, fi) is var (c0, c1))
+                {
+                    int x0 = c0 == 0 ? 0 : Theme.Measure(f.Text[..c0], f.Font).Width;
+                    int x1 = c1 >= f.Text.Length ? f.W : Theme.Measure(f.Text[..c1], f.Font).Width;
+                    // Reach back over the space before a word so a selected line reads as one band.
+                    int lead = c0 == 0 && fi > 0 && Math.Abs(l.Frags[fi - 1].Y - f.Y) < f.H && SelectedPart(m, l, fi - 1) is var (_, p1) && p1 >= l.Frags[fi - 1].Text.Length
+                        ? Math.Max(0, f.X - (l.Frags[fi - 1].X + l.Frags[fi - 1].W)) : 0;
+                    using var sel = new SolidBrush(Theme.Selection);
+                    g.FillRectangle(sel, f.X + ox + x0 - lead, f.Y + baseY - 1, x1 - x0 + lead, f.H + 2);
+                }
                 Theme.Draw(g, f.Text, f.Font, f.Color, f.X + ox, f.Y + baseY);
             }
         }
@@ -473,10 +503,168 @@ sealed class ChatView : ScrollableControl
         return (null, null);
     }
 
+    // ---------- selecting and copying text ----------
+
+    /// <summary>The place in the text nearest to a point of the window; null when there is no text at all.</summary>
+    (ChatMessage m, int frag, int ch)? PlaceAt(Point p)
+    {
+        if (_placed.Count == 0) return null;
+        int cx = p.X - ColumnX, cy = p.Y - AutoScrollPosition.Y;
+        // The message under the point, else the nearest one above or below.
+        var (top, m, l) = _placed.FirstOrDefault(t => cy <= t.top + t.laid.Height, _placed[^1]);
+        int best = -1;
+        long bestD = long.MaxValue;
+        for (int i = 0; i < l.Frags.Count; i++)
+        {
+            var f = l.Frags[i];
+            if (f.Ui) continue;
+            int fy = top + f.Y;
+            long dy = cy < fy ? fy - cy : cy > fy + f.H ? cy - (fy + f.H) : 0;
+            long dx = cx < f.X ? f.X - cx : cx > f.X + f.W ? cx - (f.X + f.W) : 0;
+            long d = dy * 10000 + dx;   // the line matters first, then the distance along it
+            if (d < bestD) { bestD = d; best = i; }
+        }
+        if (best < 0) return null;
+        var hit = l.Frags[best];
+        int ch = 0;
+        if (cx >= hit.X + hit.W) ch = hit.Text.Length;
+        else if (cx > hit.X)
+            for (ch = 0; ch < hit.Text.Length; ch++)
+            {
+                int w0 = ch == 0 ? 0 : Theme.Measure(hit.Text[..ch], hit.Font).Width;
+                int w1 = Theme.Measure(hit.Text[..(ch + 1)], hit.Font).Width;
+                if (cx - hit.X < (w0 + w1) / 2) break;
+            }
+        return (m, best, ch);
+    }
+
+    /// <summary>The selection in reading order, or null when nothing is selected.</summary>
+    ((int msg, int frag, int ch) a, (int msg, int frag, int ch) b)? Selection()
+    {
+        if (_selFrom is not { } f || _selTo is not { } t) return null;
+        int fm = Messages.IndexOf(f.m), tm = Messages.IndexOf(t.m);
+        if (fm < 0 || tm < 0) return null;
+        var a = (fm, f.frag, f.ch);
+        var b = (tm, t.frag, t.ch);
+        if (a.CompareTo(b) == 0) return null;
+        return a.CompareTo(b) < 0 ? (a, b) : (b, a);
+    }
+
+    public bool HasSelection => Selection() != null;
+
+    /// <summary>The selected characters of one fragment (from, to), or null when none of it is selected.</summary>
+    (int from, int to)? SelectedPart(ChatMessage m, Laid l, int fi)
+    {
+        if (Selection() is not var (a, b) || l.Frags[fi].Ui) return null;
+        int mi = Messages.IndexOf(m);
+        var here = (mi, fi);
+        if (here.CompareTo((a.msg, a.frag)) < 0 || here.CompareTo((b.msg, b.frag)) > 0) return null;
+        int len = l.Frags[fi].Text.Length;
+        int from = here == (a.msg, a.frag) ? Math.Min(a.ch, len) : 0;
+        int to = here == (b.msg, b.frag) ? Math.Min(b.ch, len) : len;
+        return to > from ? (from, to) : null;
+    }
+
+    /// <summary>The selected text, with line breaks where the conversation has them (not where lines only wrap).</summary>
+    public string SelectedText()
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var (_, m, l) in _placed)
+        {
+            Frag? prev = null;
+            bool any = false;
+            for (int fi = 0; fi < l.Frags.Count; fi++)
+            {
+                var f = l.Frags[fi];
+                if (f.Ui) continue;
+                if (SelectedPart(m, l, fi) is var (from, to))
+                {
+                    if (!any && sb.Length > 0) sb.Append("\n\n");                 // next message
+                    else if (any && prev != null)
+                    {
+                        if (f.Join != null) sb.Append(f.Join);                      // a wrapped line goes on
+                        else if (f.Y >= prev.Y + prev.H * 0.6)                      // a new line; blank lines kept
+                            sb.Append('\n', Math.Clamp((int)Math.Round((f.Y - prev.Y) / (double)Math.Max(1, LineHeight(f.Font) - (f.Font == Theme.Mono ? Theme.S(4) : 0))), 1, 3));
+                        else if (f.X > prev.X + prev.W + 1) sb.Append(' ');
+                    }
+                    sb.Append(f.Text, from, to - from);
+                    any = true;
+                }
+                prev = f;
+            }
+        }
+        return sb.ToString();
+    }
+
+    public bool CopySelection()
+    {
+        var text = SelectedText();
+        if (text.Length == 0) return false;
+        CopyText(text);
+        return true;
+    }
+
+    public void SelectAll()
+    {
+        var first = _placed.FirstOrDefault(p => p.laid.Frags.Any(f => !f.Ui));
+        var last = _placed.LastOrDefault(p => p.laid.Frags.Any(f => !f.Ui));
+        if (first.m == null || last.m == null) return;
+        int lf = last.laid.Frags.FindLastIndex(f => !f.Ui);
+        _selFrom = (first.m, first.laid.Frags.FindIndex(f => !f.Ui), 0);
+        _selTo = (last.m, lf, last.laid.Frags[lf].Text.Length);
+        Invalidate();
+    }
+
+    /// <summary>Everything a message holds, for "Copy message": thinking is left out, an error is included.</summary>
+    static string WholeText(ChatMessage m) =>
+        m.Error == null ? m.Content : m.Content.Length == 0 ? m.Error : m.Content + "\n\n" + m.Error;
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (e.Button != MouseButtons.Left || HitTest(e.Location).hit != null) return;
+        var at = PlaceAt(e.Location);
+        if (ModifierKeys == Keys.Shift && _selFrom != null) _selTo = at;
+        else { _selFrom = at; _selTo = at; }
+        _selecting = at != null;
+        Invalidate();
+    }
+
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
-        Cursor = HitTest(e.Location).hit != null ? Cursors.Hand : Cursors.Default;
+        if (_selecting && e.Button == MouseButtons.Left)
+        {
+            // Dragging past the top or bottom edge scrolls the conversation along.
+            if (e.Y < 0 || e.Y > ClientSize.Height)
+                AutoScrollPosition = new Point(0, -AutoScrollPosition.Y + (e.Y < 0 ? e.Y : e.Y - ClientSize.Height));
+            _selTo = PlaceAt(e.Location) ?? _selTo;
+            Invalidate();
+            return;
+        }
+        var (m, hit) = HitTest(e.Location);
+        Cursor = hit != null ? Cursors.Hand : m != null ? Cursors.IBeam : Cursors.Default;
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        _selecting = false;
+    }
+
+    protected override void OnMouseDoubleClick(MouseEventArgs e)
+    {
+        base.OnMouseDoubleClick(e);
+        // Double-click selects the word under the pointer.
+        if (e.Button != MouseButtons.Left || HitTest(e.Location).hit != null || PlaceAt(e.Location) is not { } at) return;
+        var laid = _placed.First(p => p.m == at.m).laid;
+        var text = laid.Frags[at.frag].Text;
+        int a = Math.Min(at.ch, Math.Max(0, text.Length - 1)), b = a;
+        while (a > 0 && !char.IsWhiteSpace(text[a - 1])) a--;
+        while (b < text.Length && !char.IsWhiteSpace(text[b])) b++;
+        _selFrom = (at.m, at.frag, a);
+        _selTo = (at.m, at.frag, b);
+        Invalidate();
     }
 
     protected override void OnMouseClick(MouseEventArgs e)
@@ -484,11 +672,16 @@ sealed class ChatView : ScrollableControl
         base.OnMouseClick(e);
         var (m, hit) = HitTest(e.Location);
         if (e.Button == MouseButtons.Left) { hit?.Act(); return; }
-        if (e.Button == MouseButtons.Right && m != null)
+        if (e.Button == MouseButtons.Right && (m != null || HasSelection))
         {
             var menu = new ContextMenuStrip();
-            menu.Items.Add("Copy", null, (_, _) => CopyText(m.Content));
-            if (m.Role == "user" && !Messages.Any(x => x.Streaming))
+            if (HasSelection) menu.Items.Add("Copy selection", null, (_, _) => CopySelection());
+            if (m != null) menu.Items.Add("Copy message", null, (_, _) => CopyText(WholeText(m)));
+            if (m != null && m.Thinking.Length > 0) menu.Items.Add("Copy thinking", null, (_, _) => CopyText(m.Thinking));
+            menu.Items.Add("Copy whole chat", null, (_, _) => CopyText(string.Join("\n\n",
+                Messages.Where(x => WholeText(x).Length > 0).Select(x => (x.Role == "user" ? "You: " : "Reply: ") + WholeText(x)))));
+            menu.Items.Add("Select all", null, (_, _) => SelectAll());
+            if (m != null && m.Role == "user" && !Messages.Any(x => x.Streaming))
                 menu.Items.Add("Edit", null, (_, _) => EditRequested?.Invoke(m));
             menu.Show(this, e.Location);
         }

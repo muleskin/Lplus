@@ -2,7 +2,7 @@ using System.Drawing.Drawing2D;
 
 namespace Lplus;
 
-/// <summary>The Settings page: Cloud, network, model location and context length.</summary>
+/// <summary>The Settings page: Cloud, network, model location, tools and context length.</summary>
 sealed class SettingsView : Control
 {
     public static readonly int[] ContextOptions = { 4096, 8192, 16384, 32768, 65536, 131072, 262144 };
@@ -96,6 +96,30 @@ sealed class SettingsView : Control
                     var rr = new Rectangle(pr.X, pr.Bottom + Theme.S(6), sz.Width, sz.Height);
                     Theme.Draw(gg, rs, Theme.Small, Theme.Blue, rr.X, rr.Y);
                     _hits.Add((rr, () => { _s.Models = ""; Commit(); }));
+                }
+            },
+        }, Theme.S(76), Theme.S(128));
+
+        y = Card(g, x, y, w, new Action<Graphics, Rectangle>[]
+        {
+            (gg, r) => ToggleRow(gg, r, "Tools", "Let models read this PC's clock and, in Code mode, work in your project folder.", _s.ToolsEnabled, v => _s.ToolsEnabled = v),
+            (gg, r) =>
+            {
+                Row(gg, new Rectangle(r.X, r.Y, r.Width, Theme.S(60)), "Project folder", "In Code mode, models can read and search this folder, and change files after you confirm.");
+                var pr = new Rectangle(r.X + Theme.S(16), r.Y + Theme.S(62), r.Width - Theme.S(132), Theme.S(34));
+                Theme.FillRound(gg, Theme.UserBubble, pr, Theme.S(8));
+                bool none = string.IsNullOrEmpty(_s.ProjectFolder);
+                Theme.DrawEllipsis(gg, none ? "Not set — models cannot see your files" : _s.ProjectFolder, Theme.Small, none ? Theme.Muted : Theme.TextBody,
+                    new Rectangle(pr.X + Theme.S(10), pr.Y, pr.Width - Theme.S(20), pr.Height));
+                var br = Button(gg, "Browse", r.Right - Theme.S(16), pr.Y + pr.Height / 2);
+                _hits.Add((br, BrowseProject));
+                if (!none)
+                {
+                    var rs = "Remove";
+                    var sz = Theme.Measure(rs, Theme.Small);
+                    var rr = new Rectangle(pr.X, pr.Bottom + Theme.S(6), sz.Width, sz.Height);
+                    Theme.Draw(gg, rs, Theme.Small, Theme.Blue, rr.X, rr.Y);
+                    _hits.Add((rr, () => { _s.ProjectFolder = ""; Commit(); }));
                 }
             },
         }, Theme.S(76), Theme.S(128));
@@ -225,6 +249,13 @@ sealed class SettingsView : Control
         using var dlg = new FolderBrowserDialog { Description = "Location where models are stored", UseDescriptionForTitle = true };
         if (!string.IsNullOrEmpty(_s.Models) && Directory.Exists(_s.Models)) dlg.InitialDirectory = _s.Models;
         if (dlg.ShowDialog(FindForm()) == DialogResult.OK) { _s.Models = dlg.SelectedPath; Commit(); }
+    }
+
+    void BrowseProject()
+    {
+        using var dlg = new FolderBrowserDialog { Description = "Project folder that models may work in", UseDescriptionForTitle = true };
+        if (!string.IsNullOrEmpty(_s.ProjectFolder) && Directory.Exists(_s.ProjectFolder)) dlg.InitialDirectory = _s.ProjectFolder;
+        if (dlg.ShowDialog(FindForm()) == DialogResult.OK) { _s.ProjectFolder = dlg.SelectedPath; Commit(); }
     }
 
     Rectangle SliderHit => new(_sliderR.X - Theme.S(12), _sliderR.Y - Theme.S(10), _sliderR.Width + Theme.S(24), _sliderR.Height + Theme.S(10));

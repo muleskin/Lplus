@@ -21,12 +21,21 @@ The [user guide](https://github.com/muleskin/Lplus/releases/latest/download/Lplu
   with a Copy button, and a collapsible "thinking" section for models that reason first.
 - **Model picker.** Lists the models you have installed and downloads a new one when you pick it.
 - **Images.** Attach pictures for models that can see.
+- **The clock.** Models that can call tools read your PC's clock, so "what time is it?" gets the
+  real answer. Other models are simply told the time.
+- **Chat and Code modes.** A switch in the message box. In Code mode the **+** button picks a
+  project folder, and the model can list, read and search its files and, after you confirm each
+  file, create or replace them, so "update my app" starts from the code you already have.
+  Nothing outside that folder can be reached.
+- **Copy anything.** Drag to select any text in the conversation and press Ctrl+C, or right-click
+  to copy a message, the thinking, or the whole chat.
+- **Prompt history.** Up and Down in an empty message box walk through your earlier prompts.
 - **Chat history.** Chats are saved in a local SQLite database, grouped by Today / This week /
   Older, and can be renamed or deleted.
 - **GPU status bar.** Shows your graphics card, which model is loaded, and how much of it sits in
   GPU memory.
 - **Settings.** Cloud models on or off, expose the server to your network, where models are
-  stored, and context length (4k to 256k).
+  stored, tools and the project folder, and context length (4k to 256k).
 - **Runs in the tray.** Closing the window keeps the server running; quit from the tray icon to
   stop it.
 
@@ -53,6 +62,7 @@ C# WinForms, drawn with its own controls. The only package is `Microsoft.Data.Sq
 | Option | What it does |
 | --- | --- |
 | `--selftest <report.txt> [model]` | Starts the server, lists models, asks one short question, checks the chat store, and writes a report. |
+| `--toolrun <report.txt> <model> <folder> <question>` | Asks one question with the tools on and writes down every tool step and the answer. No file is ever written. |
 | `--screenshot <file.png>` | Draws the window to a PNG and exits, using a throwaway copy of the database. |
 | `--quit` | Asks a running copy to quit and stop the server it started. |
 

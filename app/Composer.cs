@@ -2,7 +2,7 @@ using System.Drawing.Drawing2D;
 
 namespace Lplus;
 
-/// <summary>The rounded message box: text, attached files, "+" button, thinking button, model picker and send/stop.</summary>
+/// <summary>The rounded message box: text, attached files, "+" button, Chat/Code switch, thinking button, model picker and send/stop.</summary>
 sealed class Composer : Control
 {
     readonly TextBox _box;
@@ -15,8 +15,11 @@ sealed class Composer : Control
     public bool ThinkOn = true;
     public string ThinkLevel = "medium";
     public bool Editing;
+    /// <summary>Code mode: the model works in the project folder and "+" chooses that folder. Chat mode: "+" attaches files.</summary>
+    public bool CodeMode;
+    public string ProjectFolder = "";
 
-    Rectangle _attachR, _sendR, _modelR, _thinkR;
+    Rectangle _attachR, _sendR, _modelR, _thinkR, _modeR, _folderR;
     readonly List<(Rectangle r, Attachment a)> _chipX = new();
     string? _hover;
 
@@ -24,9 +27,19 @@ sealed class Composer : Control
     public event Action? StopClicked;
     public event Action<Point>? ModelClicked;
     public event Action? AttachClicked;
+    public event Action<bool>? ModeClicked;   // true = Code
     public event Action<Point>? ThinkClicked;
     public event Action? CancelEdit;
     public event Action? HeightChanged;
+
+    /// <summary>Earlier prompts, newest first, for the Up and Down arrows. Asked for each time browsing starts.</summary>
+    public Func<List<string>>? History;
+    List<string> _past = new();
+    int _pastAt = -1;          // -1 = not browsing; otherwise the index into _past that is shown
+    string _draft = "";        // what was typed before browsing started
+    bool _showingPast;         // true while the box is being filled from history
+
+    public bool HasTextSelection => _box.SelectionLength > 0;
 
     public Composer()
     {
@@ -46,7 +59,11 @@ sealed class Composer : Control
         Controls.Add(_placeholder);
         Controls.Add(_box);
         _placeholder.BringToFront();
-        _box.TextChanged += (_, _) => { _placeholder.Visible = _box.TextLength == 0; Relayout(); Invalidate(); };
+        _box.TextChanged += (_, _) =>
+        {
+            if (!_showingPast) _pastAt = -1;   // typing leaves the history
+            _placeholder.Visible = _box.TextLength == 0; Relayout(); Invalidate();
+        };
         _box.KeyDown += OnBoxKey;
         AllowDrop = true;
         _box.AllowDrop = true;
@@ -65,6 +82,10 @@ sealed class Composer : Control
             e.SuppressKeyPress = true;
             if (!Streaming) SendClicked?.Invoke();
         }
+        else if (e.KeyCode is Keys.Up or Keys.Down && e.Modifiers == Keys.None && BrowsePast(e.KeyCode == Keys.Up))
+        {
+            e.SuppressKeyPress = true;
+        }
         else if (e.KeyCode == Keys.Escape && Editing)
         {
             e.SuppressKeyPress = true;
@@ -81,6 +102,32 @@ sealed class Composer : Control
                 AddAttachment(new Attachment { Name = "pasted-image.png", Kind = "image", Path = path });
             }
         }
+    }
+
+    /// <summary>
+    /// Up shows the prompt before, Down the one after (and finally what was being typed). Works from an
+    /// empty box or while already browsing, and only from the first line (Up) or last line (Down), so the
+    /// arrows still move through a message of several lines.
+    /// </summary>
+    internal bool BrowsePast(bool up)
+    {
+        if (_pastAt < 0)
+        {
+            if (!up || _box.TextLength > 0) return false;
+            _past = History?.Invoke() ?? new();
+            _draft = _box.Text;
+        }
+        int line = _box.GetLineFromCharIndex(_box.SelectionStart);
+        int lastLine = _box.GetLineFromCharIndex(_box.TextLength);
+        if (up ? line > 0 : line < lastLine) return false;
+        int next = _pastAt + (up ? 1 : -1);
+        if (next >= _past.Count) return true;          // already at the oldest
+        if (next < -1) return false;
+        _showingPast = true;
+        try { Text = next < 0 ? _draft : _past[next]; }
+        finally { _showingPast = false; }
+        _pastAt = next;
+        return true;
     }
 
     static void OnDragEnter(object? s, DragEventArgs e)
@@ -129,6 +176,7 @@ sealed class Composer : Control
 
     public void ClearInput()
     {
+        _pastAt = -1;
         _box.Clear();
         Attachments.Clear();
         Relayout();
@@ -157,7 +205,7 @@ sealed class Composer : Control
         _box.SetBounds(pad, Theme.S(14) + ChipsH, Math.Max(10, Width - pad * 2), textH);
         _box.ScrollBars = _box.GetLineFromCharIndex(_box.TextLength) + 1 > 8 ? ScrollBars.Vertical : ScrollBars.None;
         _placeholder.Location = new Point(pad - 1, Theme.S(14) + ChipsH);
-        _placeholder.Text = Editing ? "Edit your message" : "Send a message";
+        _placeholder.Text = Editing ? "Edit your message" : CodeMode ? "Describe the change to your project" : "Send a message";
         int h = PreferredHeightFor(Width);
         if (h != Height) { Height = h; HeightChanged?.Invoke(); }
         LayoutButtons();
@@ -179,6 +227,22 @@ sealed class Composer : Control
             _thinkR = new Rectangle(_modelR.X - Theme.S(6) - tw, y, tw, b);
         }
         else _thinkR = Rectangle.Empty;
+
+        // Chat | Code switch next to "+", then (in Code mode) the project folder's name.
+        int half = Math.Max(Theme.Measure("Chat", Theme.Small).Width, Theme.Measure("Code", Theme.Small).Width) + Theme.S(20);
+        int mh = Theme.S(28);
+        _modeR = new Rectangle(_attachR.Right + Theme.S(6), y + (b - mh) / 2, half * 2, mh);
+        int limit = (_thinkR.IsEmpty ? _modelR.X : _thinkR.X) - Theme.S(8);
+        int fx = _modeR.Right + Theme.S(8);
+        int fw = Math.Min(Theme.Measure(FolderLabel(), Theme.Small).Width + Theme.S(12), limit - fx);
+        _folderR = CodeMode && fw > Theme.S(48) ? new Rectangle(fx, y, fw, b) : Rectangle.Empty;
+    }
+
+    string FolderLabel()
+    {
+        if (string.IsNullOrEmpty(ProjectFolder)) return "Choose a project folder";
+        var name = Path.GetFileName(ProjectFolder.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        return name.Length > 0 ? name : ProjectFolder;
     }
 
     string ThinkLabel() => ThinkMode == "level"
@@ -229,6 +293,22 @@ sealed class Composer : Control
             g.DrawLine(pen, mx - k, my, mx + k, my);
             g.DrawLine(pen, mx, my - k, mx, my + k);
         }
+
+        // Chat | Code switch.
+        Theme.FillRound(g, Theme.UserBubble, _modeR, _modeR.Height / 2f);
+        int hw = _modeR.Width / 2;
+        var onR = new Rectangle(_modeR.X + (CodeMode ? hw : 0) + Theme.S(2), _modeR.Y + Theme.S(2), hw - Theme.S(4), _modeR.Height - Theme.S(4));
+        Theme.FillRound(g, Color.White, onR, onR.Height / 2f);
+        Theme.DrawRound(g, Theme.Border, onR, onR.Height / 2f);
+        for (int i = 0; i < 2; i++)
+        {
+            var word = i == 0 ? "Chat" : "Code";
+            var ws = Theme.Measure(word, Theme.Small);
+            Theme.Draw(g, word, Theme.Small, (i == 1) == CodeMode ? Theme.Text : Theme.Muted,
+                _modeR.X + i * hw + (hw - ws.Width) / 2, _modeR.Y + (_modeR.Height - ws.Height) / 2);
+        }
+        if (!_folderR.IsEmpty)
+            Theme.DrawEllipsis(g, FolderLabel(), Theme.Small, string.IsNullOrEmpty(ProjectFolder) ? Theme.Blue : Theme.Muted, _folderR);
 
         // Thinking button.
         if (ThinkMode != "")
@@ -287,7 +367,7 @@ sealed class Composer : Control
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
-        string? h = _attachR.Contains(e.Location) ? "attach" : _modelR.Contains(e.Location) ? "model" :
+        string? h = _attachR.Contains(e.Location) ? "attach" : _modeR.Contains(e.Location) ? "mode" : _folderR.Contains(e.Location) ? "folder" : _modelR.Contains(e.Location) ? "model" :
             _thinkR.Contains(e.Location) ? "think" : _sendR.Contains(e.Location) ? "send" :
             _chipX.Any(c => c.r.Contains(e.Location)) ? "chip" : null;
         Cursor = h != null ? Cursors.Hand : Cursors.IBeam;
@@ -307,7 +387,8 @@ sealed class Composer : Control
         if (e.Button != MouseButtons.Left) return;
         foreach (var (r, a) in _chipX)
             if (r.Contains(e.Location)) { Attachments.Remove(a); Relayout(); Invalidate(); return; }
-        if (_attachR.Contains(e.Location)) AttachClicked?.Invoke();
+        if (_attachR.Contains(e.Location) || _folderR.Contains(e.Location)) AttachClicked?.Invoke();
+        else if (_modeR.Contains(e.Location)) ModeClicked?.Invoke(e.X >= _modeR.X + _modeR.Width / 2);
         else if (_modelR.Contains(e.Location)) ModelClicked?.Invoke(PointToScreen(new Point(_modelR.X, _modelR.Bottom + 4)));
         else if (_thinkR.Contains(e.Location)) ThinkClicked?.Invoke(PointToScreen(new Point(_thinkR.X, _thinkR.Bottom + 4)));
         else if (_sendR.Contains(e.Location)) { if (Streaming) StopClicked?.Invoke(); else SendClicked?.Invoke(); }

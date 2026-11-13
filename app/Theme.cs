@@ -9,6 +9,7 @@ static class Theme
     public static int S(int v) => (int)Math.Round(v * Scale);
     public static float Sf(float v) => v * Scale;
 
+    public static readonly Color Selection = Color.FromArgb(191, 219, 254);   // behind text selected with the mouse
     public static readonly Color Background = Color.White;
     public static readonly Color Sidebar = Color.FromArgb(250, 250, 250);
     public static readonly Color SidebarHover = Color.FromArgb(238, 238, 238);

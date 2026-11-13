@@ -9,7 +9,7 @@
     <AssemblyName>Lplus</AssemblyName>
     <RootNamespace>Lplus</RootNamespace>
     <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <Product>Lplus</Product>
     <Description>A desktop chat app for local AI models</Description>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
