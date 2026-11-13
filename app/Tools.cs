@@ -11,7 +11,7 @@ namespace Lplus;
 /// </summary>
 static partial class Tools
 {
-    public const int MaxRounds = 30;      // tool steps allowed in one reply
+    public const int MaxRounds = 80;      // tool steps allowed in one reply
     const int MaxRead = 60_000;           // characters of one file handed to the model
     const int MaxList = 400;              // entries in one listing
     const int MaxHits = 60;               // lines in one search result
@@ -44,10 +44,12 @@ static partial class Tools
           + (HasFolder(folder)
               ? " The user's project folder is available through list_files, read_file, search_files, edit_file, write_file and run_command."
                 + " When asked to create or change an application, look at the existing files first and update them rather than starting over."
+                + " Always read a file with read_file before you change it, and keep everything in it that is not part of the task (existing functions and tests stay)."
                 + " To change part of a file use edit_file with the exact text to replace; use write_file only for new files or complete rewrites"
                 + " (it replaces the whole file, so send the complete new contents)."
                 + " After changing code, call run_command to build or test it (for example \"dotnet build\", \"npm test\", \"cargo build\", \"python -m pytest\"),"
-                + " read the errors and fix them. Paths are relative to the project folder."
+                + " read the errors and fix them, and repeat until it works. To find a bug, run the program or its tests with run_command and read what it prints."
+                + " Paths are relative to the project folder." + ProjectNote(folder)
               : "");
 
     public static bool HasFolder(string folder) => !string.IsNullOrWhiteSpace(folder) && Directory.Exists(folder);
@@ -72,8 +74,10 @@ static partial class Tools
         if (!HasFolder(folder)) return list;
         list.Add(Fn("list_files", "List the files and folders in the user's project folder.",
             ("path", "string", "Folder to list, relative to the project folder. Leave empty for the whole project.", false)));
-        list.Add(Fn("read_file", "Read a text file from the user's project folder.",
-            ("path", "string", "File to read, relative to the project folder.", true)));
+        list.Add(Fn("read_file", "Read a text file from the user's project folder. For a long file, give start_line and end_line to read just that part.",
+            ("path", "string", "File to read, relative to the project folder.", true),
+            ("start_line", "integer", "First line to read (1 is the first line). Leave out to start at the top.", false),
+            ("end_line", "integer", "Last line to read. Leave out to read to the end.", false)));
         list.Add(Fn("search_files", "Find text in the project's files. Returns matching lines as path:line: text.",
             ("query", "string", "Text to look for (not case sensitive).", true),
             ("path", "string", "Folder to search, relative to the project folder. Leave empty for the whole project.", false)));
@@ -138,7 +142,7 @@ static partial class Tools
     /// is refused when nobody can be asked. Problems come back as "Error: ..." so the model can try something else.
     /// </summary>
     public static async Task<string> Run(string name, JsonNode? args, string folder, Func<string, bool, Task<bool>> confirmWrite,
-        bool web = false, Func<string, string, Task<bool>>? confirmCommand = null)
+        bool web = false, Func<string, string, Task<bool>>? confirmCommand = null, Action<string>? beforeChange = null)
     {
         try
         {
@@ -161,9 +165,10 @@ static partial class Tools
                 case "read_file":
                 {
                     var file = Resolve(root, Arg(args, "path"));
-                    if (File.Exists(file)) return await Task.Run(() => Read(file));
+                    int from = Int(args, "start_line"), to = Int(args, "end_line");
+                    if (File.Exists(file)) return await Task.Run(() => Read(file, from, to));
                     var (found, problem) = await Task.Run(() => FindByName(root, file));
-                    return found == null ? problem : await Task.Run(() => $"(This file is at {Rel(root, found)}.)\n" + Read(found));
+                    return found == null ? problem : await Task.Run(() => $"(This file is at {Rel(root, found)}.)\n" + Read(found, from, to));
                 }
                 case "search_files":
                 {
@@ -188,6 +193,7 @@ static partial class Tools
                     var content = Arg(args, "content");
                     bool exists = File.Exists(file);
                     if (!await confirmWrite(file, exists)) return Declined;
+                    beforeChange?.Invoke(file);   // lets the caller keep a copy for undo
                     Directory.CreateDirectory(Path.GetDirectoryName(file)!);
                     await File.WriteAllTextAsync(file, content, new UTF8Encoding(false));
                     int lines = content.Count(c => c == '\n') + (content.Length > 0 && !content.EndsWith('\n') ? 1 : 0);
@@ -215,12 +221,15 @@ static partial class Tools
                     {
                         // The same lines with different indentation or trailing spaces still count, if there is one such place.
                         var loose = LooseFind(body, oldText);
-                        if (loose == null) return "Error: old_text was not found in the file. Call read_file and copy the text exactly as it is there.";
+                        if (loose == null)
+                            return "Error: old_text was not found in the file, so nothing was changed. Copy the text to replace exactly from the file"
+                                + (body.Length <= 6000 ? ". The file contains:\n" + body : "; call read_file to see it.");
                         (at, oldText) = (loose.Value.at, body.Substring(loose.Value.at, loose.Value.length));
                     }
                     if (body.IndexOf(oldText, at + 1, StringComparison.Ordinal) >= 0)
                         return "Error: old_text appears more than once in the file. Include more of the lines around it so it is unique.";
                     if (!await confirmWrite(file, true)) return Declined;
+                    beforeChange?.Invoke(file);
                     body = body[..at] + newText + body[(at + oldText.Length)..];
                     await File.WriteAllTextAsync(file, crlf ? body.Replace("\n", "\r\n") : body, new UTF8Encoding(false));
                     int line = body[..at].Count(c => c == '\n') + 1;
@@ -342,12 +351,21 @@ static partial class Tools
         catch { return true; }
     }
 
-    static string Read(string file)
+    static int Int(JsonNode? args, string name) => int.TryParse(Arg(args, name), out var n) ? n : 0;
+
+    static string Read(string file, int from = 0, int to = 0)
     {
         if (new FileInfo(file).Length > MaxFileBytes) return "Error: that file is too large to read (over 2 MB).";
         if (LooksBinary(file)) return "Error: that is not a text file.";
         var text = File.ReadAllText(file);
-        return text.Length <= MaxRead ? text : text[..MaxRead] + $"\n… (cut off: the file has {text.Length} characters, only the first {MaxRead} are shown)";
+        if (from > 0 || to > 0)
+        {
+            var lines = text.Replace("\r\n", "\n").Split('\n');
+            int a = Math.Clamp(from <= 0 ? 1 : from, 1, Math.Max(1, lines.Length)), b = Math.Clamp(to <= 0 ? lines.Length : to, a, lines.Length);
+            text = $"(Lines {a} to {b} of {lines.Length}.)\n" + string.Join("\n", lines[(a - 1)..b]);
+        }
+        return text.Length <= MaxRead ? text
+            : text[..MaxRead] + $"\n… (cut off: {text.Length} characters in all, only the first {MaxRead} are shown. Read the rest with start_line and end_line.)";
     }
 
     // Logs and data dumps drown out the code in a search.
@@ -463,6 +481,31 @@ static partial class Tools
     /// Cuts text into the JSON objects or arrays written in it back to back. Yields null when something
     /// that is not JSON sits between or after them.
     /// </summary>
+    /// <summary>
+    /// Tool requests found anywhere in a piece of text: each JSON object that opens a line (or follows a
+    /// ```json fence or a tool_call tag) and names a known tool. Text between them is ignored.
+    /// </summary>
+    public static List<JsonNode> EmbeddedCalls(string text, JsonArray tools)
+    {
+        var found = new List<JsonNode>();
+        int i = 0;
+        while (i < text.Length)
+        {
+            int open = text.IndexOf('{', i);
+            if (open < 0) break;
+            // Only an object at the start of a line or straight after a tag can be a request.
+            int back = open - 1;
+            while (back >= 0 && text[back] is ' ' or '\t') back--;
+            bool starts = back < 0 || text[back] == '\n' || text[..(back + 1)].EndsWith("<tool_call>") || text[..(back + 1)].EndsWith("```json") || text[..(back + 1)].EndsWith("```");
+            string? piece = starts ? JsonPieces(text[open..]).FirstOrDefault() : null;
+            var calls = piece != null ? TextCalls(piece, tools) : new List<JsonNode>();
+            if (calls.Count == 0) { i = open + 1; continue; }
+            found.AddRange(calls);
+            i = open + piece!.Length;
+        }
+        return found;
+    }
+
     static IEnumerable<string?> JsonPieces(string s)
     {
         int i = 0;
@@ -493,12 +536,20 @@ static partial class Tools
     /// One whole reply: asks the model, runs the tools it calls, hands the results back and asks again until
     /// it answers in words. run(name, args) does one tool and returns its result.
     /// </summary>
+    /// <param name="check">
+    /// Called when the model says it is finished. Returns null when the work is fine, or what is wrong
+    /// (a failed build, failing tests); that is handed to the model and it carries on, up to MaxChecks times.
+    /// </param>
+    /// <param name="contextLength">How much the model can hold, in tokens (0 = unknown: nothing is trimmed).</param>
     public static async Task Converse(ServerClient client, string model, JsonArray messages, JsonNode? think, JsonArray? tools,
-        Func<string, JsonNode?, Task<string>> run, Action<string, string> onDelta, CancellationToken ct)
+        Func<string, JsonNode?, Task<string>> run, Action<string, string> onDelta, CancellationToken ct,
+        Func<Task<string?>>? check = null, int contextLength = 0)
     {
-        int nudges = 0;
+        int nudges = 0, checks = 0;
         for (int round = 0; ; round++)
         {
+            // Roughly three characters to a token, with room left for the tool list and the answer.
+            if (contextLength > 0) Compact(messages, Math.Max(6000, (contextLength - 3000) * 3));
             var content = new StringBuilder();
             var thinking = new StringBuilder();
             int shown = 0;   // how much of this round's text has been passed on
@@ -512,11 +563,14 @@ static partial class Tools
                 var pending = content.ToString(shown, upTo - shown);
                 shown = upTo;
                 if (pending.Length > 0 || t.Length > 0) onDelta(pending, t);
-            }, ct, tools);
+            }, ct, tools, contextLength);
             if (shown < content.Length)
             {
                 var held = content.ToString(shown, content.Length - shown);
                 var written = calls.Count == 0 && tools != null ? TextCalls(held, tools) : new List<JsonNode>();
+                // Requests mixed in with talk ("I'll read the file: {...} Now I'll fix it: {...}") count too; the talk
+                // around them describes steps that have not happened yet, so it is not shown.
+                if (written.Count == 0 && calls.Count == 0 && tools != null) written = EmbeddedCalls(held, tools);
                 if (written.Count == 0) onDelta(held, "");            // it was part of the answer after all
                 else { calls = written; content.Length = shown; }   // a request: run it, don't show it
             }
@@ -526,6 +580,20 @@ static partial class Tools
                 nudges++;
                 messages.Add(new JsonObject { ["role"] = "user", ["content"] = "Carry on: use the tools to finish the task, then tell me what you did." });
                 continue;
+            }
+            // The model says it is done: the work is checked, and it is sent back while the check fails.
+            if (calls.Count == 0 && tools != null && check != null && checks < MaxChecks)
+            {
+                ct.ThrowIfCancellationRequested();
+                var problem = await check();
+                if (problem != null)
+                {
+                    checks++;
+                    messages.Add(new JsonObject { ["role"] = "assistant", ["content"] = content.ToString() });
+                    messages.Add(new JsonObject { ["role"] = "user", ["content"] = problem });
+                    onDelta("\n\n", "");
+                    continue;
+                }
             }
             if (calls.Count == 0 || tools == null) return;
             if (round >= MaxRounds) throw new InvalidOperationException("Stopped: the model kept using tools without answering.");

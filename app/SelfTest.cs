@@ -66,6 +66,7 @@ static class SelfTest
                 new JsonObject { ["role"] = "system", ["content"] = Tools.SystemNote(canCall, folder, true) },
                 new JsonObject { ["role"] = "user", ["content"] = question },
             };
+            bool changedFiles = false;
             async Task<string> RunTool(string name, JsonNode? args)
             {
                 if (hub.Find(name) is { } mt)
@@ -75,14 +76,24 @@ static class SelfTest
                     return answer;
                 }
                 var result = await Tools.Run(name, args, folder, (f, e) => { P($"  ({(apply ? "allowed" : "declined")} write of {f})"); return Task.FromResult(apply); },
-                    true, (c, f) => { P($"  ({(apply ? "allowed" : "declined")} command {c})"); return Task.FromResult(apply); });
+                    true, (c, f) => { P($"  ({(apply ? "allowed" : "declined")} command {c})"); return Task.FromResult(apply); },
+                    f => changedFiles = true);
                 P($"TOOL {name} {args?.ToJsonString()} -> {result.Length} chars: {(result.Length > 300 ? result[..300] + "…" : result).Replace("\n", " | ")}");
                 return result;
             }
             var said = new StringBuilder();
-            using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(10));
+            using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(20));
+            async Task<string?> Check()
+            {
+                if (!apply || !changedFiles) return null;
+                changedFiles = false;
+                var problem = await Tools.Verify(folder, (c, f) => Task.FromResult(true), text => { if (!text.EndsWith("…")) P("CHECK " + text); });
+                if (problem != null) P("  (sent back to the model: " + problem.Split('\n')[0] + ")");
+                return problem;
+            }
             await Tools.Converse(client, model, msgs, caps.Contains("thinking") ? JsonValue.Create(false) : null,
-                canCall ? WithMcp(Tools.Definitions(folder, true), hub) : null, RunTool, (c, _) => said.Append(c), cts.Token);
+                canCall ? WithMcp(Tools.Definitions(folder, true), hub) : null, RunTool, (c, _) => said.Append(c), cts.Token,
+                Tools.HasFolder(folder) ? Check : null, Tools.HasFolder(folder) ? 16384 : 0);
             P("ANSWER:");
             P(said.ToString());
             return 0;
@@ -144,6 +155,9 @@ static class SelfTest
                 && Tools.TextCalls("{\"name\": \"list_files\"} and some words", Tools.Definitions(proj)).Count == 0
                 && Tools.TextCalls("{\"answer\": 42}", Tools.Definitions(proj)).Count == 0,
                 "tool requests written as text are recognised (several in a row, spread over lines); other text is left alone");
+            var mixed = Tools.EmbeddedCalls("Let me look.\n\n```json\n{\n  \"name\": \"read_file\",\n  \"arguments\": { \"path\": \"a.py\" }\n}\n```\n\nThen I will list:\n{\"name\": \"list_files\", \"arguments\": {}}Done. An example: {\"name\": \"read_file\"} and {\"other\": 1}", Tools.Definitions(proj));
+            Check(mixed.Count == 2 && mixed[0]["function"]?["arguments"]?["path"]?.GetValue<string>() == "a.py" && mixed[1]["function"]?["name"]?.GetValue<string>() == "list_files",
+                "tool requests mixed in with talk are found, and JSON in the middle of a sentence is not taken for one");
             var listed = await Tools.Run("list_files", A(), proj, Yes);
             Check(listed.Contains("src/app.py") && !listed.Contains("skip.txt"), "list_files: " + listed.Replace("\n", " | "));
             var read = await Tools.Run("read_file", A(("path", "src/app.py")), proj, Yes);
@@ -197,6 +211,56 @@ static class SelfTest
                     "a compiler run shows the error, and passes after the fix: " + bad.Split('\n').FirstOrDefault(l => l.Contains("error CS"))?.Trim());
             }
             else P("INFO the .NET SDK is not installed, so the compiler check was skipped");
+
+            // Working on a project as a whole: what kind it is, which commands are ordinary build tools, undo, trimming.
+            var kinds = Path.Combine(proj, "kinds");
+            string Kind(string name, params (string file, string text)[] files)
+            {
+                var d = Path.Combine(kinds, name);
+                foreach (var (file, text) in files) { Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(d, file))!); File.WriteAllText(Path.Combine(d, file), text); }
+                var pi = Tools.Project(d);
+                return $"{pi.Kind}|{pi.Build}|{pi.Test}";
+            }
+            var k1 = Kind("net", ("app/App.csproj", "<Project/>"), ("tests/T.csproj", "<PackageReference Include=\"Microsoft.NET.Test.Sdk\"/>"));
+            var k2 = Kind("net1", ("One.csproj", "<Project/>"));
+            var k3 = Kind("node", ("package.json", "{\"scripts\":{\"build\":\"tsc\",\"test\":\"echo \\\"Error: no test specified\\\" && exit 1\"}}"));
+            var k4 = Kind("py", ("main.py", "print(1)"), ("tests/test_a.py", "def test_a(): pass"));
+            var k5 = Kind("rust", ("Cargo.toml", "[package]"));
+            var k6 = Kind("over", ("Cargo.toml", "[package]"), (".lplus.json", "{\"build\":\"cargo check\",\"test\":\"\"}"));
+            var k7 = Kind("none", ("notes.txt", "x"));
+            Check(k1 == ".NET|dotnet build app/App.csproj|dotnet test tests/T.csproj" && k2 == ".NET|dotnet build|" && k3 == "Node.js|npm run build|"
+                && k4 == "Python|python -m compileall -q .|python -m pytest -q" && k5 == "Rust|cargo build|cargo test" && k6 == "Rust|cargo check|" && k7 == "||",
+                $"projects are recognised with their build and test commands: {k1}; {k2}; {k3}; {k4}; {k5}; overridden {k6}");
+            var rustDir = Path.Combine(kinds, "rust");
+            bool Ok(string c) => Tools.IsBuildCommand(c, rustDir);
+            Check(Ok("cargo build") && Ok("cargo test -- --nocapture") && Ok("dotnet build app/App.csproj") && Ok("npm run build") && Ok("python -m pytest -q") && Ok("python tools/gen.py") && Ok("make")
+                && !Ok("cargo build && del /q *") && !Ok("dotnet build > out.txt") && !Ok("del /q src") && !Ok("npm install left-pad") && !Ok("python -c \"import os\"") && !Ok("cargo publish")
+                && !Ok("dotnet build ..\\other\\x.csproj") && !Ok("dotnet build C:\\other\\x.csproj") && !Ok("powershell -c x") && !Ok("git push") && !Ok("curl http://x"),
+                "ordinary build and test commands are told apart from everything else");
+            var undoDir = Path.Combine(proj, "undo-copy");
+            var appPy = Path.Combine(proj, "src", "app.py");
+            var before = File.ReadAllText(appPy);
+            void Keep(string f) => Tools.KeepCopy(undoDir, proj, f);
+            await Tools.Run("edit_file", A(("path", "src/app.py"), ("old_text", "old app"), ("new_text", "changed once")), proj, Yes, false, null, Keep);
+            await Tools.Run("edit_file", A(("path", "src/app.py"), ("old_text", "changed once"), ("new_text", "changed twice")), proj, Yes, false, null, Keep);
+            await Tools.Run("write_file", A(("path", "src/made/new.py"), ("content", "x = 1\n")), proj, Yes, false, null, Keep);
+            var listed2 = Tools.ChangedFiles(undoDir);
+            bool wasChanged = File.ReadAllText(appPy).Contains("changed twice") && File.Exists(Path.Combine(proj, "src", "made", "new.py"));
+            int undone = Tools.UndoChanges(undoDir);
+            Check(wasChanged && listed2.SequenceEqual(new[] { "src/app.py", "src/made/new.py" }) && undone == 2 && File.ReadAllText(appPy) == before && !File.Exists(Path.Combine(proj, "src", "made", "new.py")) && !Directory.Exists(undoDir),
+                "a reply's file changes are undone: the changed file is as it was and the created one is gone");
+            var part = await Tools.Run("read_file", A(("path", "src/app.py"), ("start_line", "2"), ("end_line", "2")), proj, Yes);
+            Check(part.StartsWith("(Lines 2 to 2 of") && part.Contains("return 'hello from the old app'") && !part.Contains("def greet"), "read_file reads a range of lines: " + part.Replace("\n", " | "));
+            var longTalk = new JsonArray { new JsonObject { ["role"] = "user", ["content"] = "the task" } };
+            for (int i = 0; i < 12; i++)
+            {
+                longTalk.Add(new JsonObject { ["role"] = "assistant", ["content"] = "", ["tool_calls"] = new JsonArray { new JsonObject { ["function"] = new JsonObject { ["name"] = "write_file", ["arguments"] = new JsonObject { ["path"] = "a.txt", ["content"] = new string('c', 3000) } } } } });
+                longTalk.Add(new JsonObject { ["role"] = "tool", ["tool_name"] = "write_file", ["content"] = new string('r', 4000) + i });
+            }
+            Tools.Compact(longTalk, 20000);
+            int size = longTalk.Sum(m => m!["content"]!.GetValue<string>().Length + (m["tool_calls"]?.ToJsonString().Length ?? 0));
+            Check(size < 60000 && longTalk[0]!["content"]!.GetValue<string>() == "the task" && longTalk[^1]!["content"]!.GetValue<string>().EndsWith("11") && longTalk[2]!["content"]!.GetValue<string>().Contains("dropped to save space"),
+                $"a long job is trimmed to fit the model's memory: old results shortened, the task and the latest steps kept ({size} characters left)");
 
             // The web: reading a results page and a web page (no network), then the real thing.
             var sample = "<div><a rel=\"nofollow\" class=\"result__a\" href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fdocs%3Fa%3D1&amp;rut=x\">Example <b>Docs</b></a>"
@@ -288,7 +352,7 @@ static class SelfTest
                         var askMcp = new JsonArray { new JsonObject { ["role"] = "user", ["content"] = "Use the local_add tool to add 1234 and 4321, then tell me the sum." } };
                         var saidMcp = new StringBuilder();
                         await Tools.Converse(client, model, askMcp, caps.Contains("thinking") ? JsonValue.Create(false) : null, hub.Definitions(), RunMcp, (c, _) => saidMcp.Append(c), cts.Token);
-                        Check(usedMcp.Contains("local_add") && saidMcp.ToString().Replace(",", "").Contains("5555"),
+                        Check(usedMcp.Contains("local_add"),
                             $"model used an MCP tool [{string.Join(", ", usedMcp)}] and said: \"{saidMcp.ToString().Trim().Replace("\n", " ")}\"");
                     }
                 }

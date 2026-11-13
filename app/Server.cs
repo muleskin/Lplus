@@ -86,10 +86,11 @@ sealed class ServerClient
     /// (empty when it just answered).
     /// </summary>
     public async Task<List<JsonNode>> Chat(string model, JsonArray messages, JsonNode? think,
-        Action<string, string> onDelta, CancellationToken ct, JsonArray? tools = null)
+        Action<string, string> onDelta, CancellationToken ct, JsonArray? tools = null, int contextLength = 0)
     {
         var calls = new List<JsonNode>();
         var body = new JsonObject { ["model"] = model, ["messages"] = messages.DeepClone(), ["stream"] = true };
+        if (contextLength > 0) body["options"] = new JsonObject { ["num_ctx"] = contextLength };
         if (think != null) body["think"] = think.DeepClone();
         if (tools is { Count: > 0 }) body["tools"] = tools.DeepClone();
         await Stream("/api/chat", body, line =>

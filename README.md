@@ -30,9 +30,15 @@ The [user guide](https://github.com/muleskin/Lplus/releases/latest/download/Lplu
   Nothing outside that folder can be reached.
 - **Going online.** Models that can call tools can search the web and read pages when they need
   to look something up, and say where they found it. There is a switch for it in Settings.
-- **Changing and building code.** In Code mode the model can also change part of a file and run
-  build or test commands in the project folder (`dotnet build`, `npm test`, ...), read the errors
-  and fix them. Every file change and every command asks you first.
+- **Working on an existing project.** In Code mode the model reads your code, changes it, and
+  runs build, test and run commands in the project folder (`dotnet build`, `npm test`, ...) to
+  find and fix problems. Lplus works out how the project is built and tested (.NET, Node.js,
+  Python, Rust, Go, Java, CMake, Make) and, each time the model says it is finished, builds and
+  tests the project itself and sends any errors back, so the model keeps going until it passes.
+- **You stay in charge.** Every file change and every command asks first, unless you turn on
+  **Work without asking** in Settings: then file changes and ordinary build and test commands go
+  ahead on their own, and anything else still asks. A copy of each changed file is kept, and
+  **Undo file changes** under the reply puts them all back.
 - **MCP servers.** The MCP servers page (in the sidebar) lists your Model Context Protocol
   servers with how each is doing. Add, edit, remove, switch on or off and connect them there,
   filter the list, or search the public MCP registry and add a server from the results. **Import** brings in the servers already set up for Claude Code or the Claude desktop app. Servers
@@ -46,7 +52,7 @@ The [user guide](https://github.com/muleskin/Lplus/releases/latest/download/Lplu
 - **GPU status bar.** Shows your graphics card, which model is loaded, and how much of it sits in
   GPU memory.
 - **Settings.** Cloud models on or off, expose the server to your network, where models are
-  stored, tools, web access and the project folder, and context length (4k to 256k).
+  stored, tools, web access, working without asking and the project folder, and context length (4k to 256k).
 - **Runs in the tray.** Closing the window keeps the server running; quit from the tray icon to
   stop it.
 
@@ -77,6 +83,15 @@ C# WinForms, drawn with its own controls. The only package is `Microsoft.Data.Sq
 | `--mcp-check <report.txt>` | Connects to every server in `mcp.json` and writes down how each answered: its protocol, what it offers and its tools. No tool is run. |
 | `--screenshot <file.png>` | Draws the window to a PNG and exits, using a throwaway copy of the database. |
 | `--quit` | Asks a running copy to quit and stop the server it started. |
+
+## Build and test commands
+
+Lplus picks the commands from what it finds in the project folder. To set them yourself, put a
+`.lplus.json` in the folder; an empty string means "none":
+
+```json
+{ "build": "dotnet build app/App.csproj", "test": "dotnet test tests/Tests.csproj" }
+```
 
 ## MCP servers
 

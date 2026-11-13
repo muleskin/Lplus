@@ -24,6 +24,7 @@ class ChatMessage
     public List<Attachment> Attachments { get; set; } = new();
     public string? Error { get; set; }
     public List<string> Tools { get; set; } = new();  // what the model did on this PC for this reply
+    public string? BackupDir { get; set; }            // where the files this reply changed are kept as they were, for undo
 
     // Live state, not stored.
     public bool Streaming;
@@ -54,6 +55,7 @@ class Settings
     public int WindowWidth = 1000;
     public int WindowHeight = 720;
     public bool ToolsEnabled = true;     // the model may read the clock and use the project folder
+    public bool AutoApprove = false;     // Code mode: change files and run build and test commands without asking each time
     public bool WebEnabled = true;       // the model may search the web and read pages
     public string Mode = "chat";         // "chat", or "code" = the model works in the project folder
     public string ProjectFolder = "";    // where the file tools work; empty = no file access
@@ -91,6 +93,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);");
         try { Exec("ALTER TABLE messages ADD COLUMN tools TEXT NOT NULL DEFAULT '[]'"); } catch (SqliteException) { /* already there */ }
+        try { Exec("ALTER TABLE messages ADD COLUMN backup TEXT"); } catch (SqliteException) { /* already there */ }
     }
 
     void Exec(string sql, params (string, object?)[] args)
@@ -149,7 +152,7 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         lock (_gate)
         {
             using var cmd = _db.CreateCommand();
-            cmd.CommandText = "SELECT id, role, content, thinking, model, created_at, thinking_time_start, thinking_time_end, attachments, error, tools FROM messages WHERE chat_id=$c ORDER BY id";
+            cmd.CommandText = "SELECT id, role, content, thinking, model, created_at, thinking_time_start, thinking_time_end, attachments, error, tools, backup FROM messages WHERE chat_id=$c ORDER BY id";
             cmd.Parameters.AddWithValue("$c", chatId);
             using var r = cmd.ExecuteReader();
             while (r.Read())
@@ -164,6 +167,7 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 };
                 try { m.Attachments = JsonSerializer.Deserialize<List<Attachment>>(r.GetString(8)) ?? new(); } catch { }
                 try { m.Tools = JsonSerializer.Deserialize<List<string>>(r.GetString(10)) ?? new(); } catch { }
+                m.BackupDir = r.IsDBNull(11) ? null : r.GetString(11);
                 list.Add(m);
             }
         }
@@ -178,8 +182,8 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             lock (_gate)
             {
                 using var cmd = _db.CreateCommand();
-                cmd.CommandText = @"INSERT INTO messages(chat_id,role,content,thinking,model,created_at,thinking_time_start,thinking_time_end,attachments,error,tools)
-VALUES($c,$r,$co,$th,$m,$cr,$ts,$te,$a,$e,$tl); SELECT last_insert_rowid();";
+                cmd.CommandText = @"INSERT INTO messages(chat_id,role,content,thinking,model,created_at,thinking_time_start,thinking_time_end,attachments,error,tools,backup)
+VALUES($c,$r,$co,$th,$m,$cr,$ts,$te,$a,$e,$tl,$bk); SELECT last_insert_rowid();";
                 Bind(cmd, chatId, m, att);
                 m.Id = (long)cmd.ExecuteScalar()!;
             }
@@ -190,7 +194,7 @@ VALUES($c,$r,$co,$th,$m,$cr,$ts,$te,$a,$e,$tl); SELECT last_insert_rowid();";
             {
                 using var cmd = _db.CreateCommand();
                 cmd.CommandText = @"UPDATE messages SET role=$r, content=$co, thinking=$th, model=$m, created_at=$cr,
-thinking_time_start=$ts, thinking_time_end=$te, attachments=$a, error=$e, tools=$tl WHERE id=$id AND chat_id=$c";
+thinking_time_start=$ts, thinking_time_end=$te, attachments=$a, error=$e, tools=$tl, backup=$bk WHERE id=$id AND chat_id=$c";
                 Bind(cmd, chatId, m, att);
                 cmd.Parameters.AddWithValue("$id", m.Id);
                 cmd.ExecuteNonQuery();
@@ -212,6 +216,7 @@ thinking_time_start=$ts, thinking_time_end=$te, attachments=$a, error=$e, tools=
         cmd.Parameters.AddWithValue("$a", att);
         cmd.Parameters.AddWithValue("$e", (object?)m.Error ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$tl", JsonSerializer.Serialize(m.Tools));
+        cmd.Parameters.AddWithValue("$bk", (object?)m.BackupDir ?? DBNull.Value);
     }
 
     /// <summary>What the person asked before, newest first, each prompt once (for the Up arrow in the message box).</summary>
@@ -265,6 +270,7 @@ thinking_time_start=$ts, thinking_time_end=$te, attachments=$a, error=$e, tools=
         s.ToolsEnabled = B("tools_enabled", s.ToolsEnabled);
         s.ProjectFolder = T("project_folder", s.ProjectFolder);
         s.WebEnabled = B("web_enabled", s.WebEnabled);
+        s.AutoApprove = B("auto_approve", s.AutoApprove);
         s.Mode = T("mode", s.Mode) == "code" ? "code" : "chat";
         return s;
     }
@@ -287,6 +293,7 @@ thinking_time_start=$ts, thinking_time_end=$te, attachments=$a, error=$e, tools=
         P("tools_enabled", B(s.ToolsEnabled));
         P("project_folder", s.ProjectFolder);
         P("web_enabled", B(s.WebEnabled));
+        P("auto_approve", B(s.AutoApprove));
         P("mode", s.Mode);
     }
 

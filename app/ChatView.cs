@@ -55,6 +55,7 @@ sealed class ChatView : ScrollableControl
 
     public event Action<ChatMessage>? EditRequested;
     public event Action<ChatMessage>? RetryRequested;
+    public event Action<ChatMessage>? UndoRequested;
 
     public ChatView()
     {
@@ -195,7 +196,7 @@ sealed class ChatView : ScrollableControl
     {
         int W = ColumnWidth;
         bool thinkOpen = m.ThinkingOpen || (m.Streaming && m.Content.Length == 0 && m.Thinking.Length > 0);
-        var key = $"{W}|{m.Content.Length}|{m.Thinking.Length}|{thinkOpen}|{m.Streaming}|{m.DownloadStatus}|{m.DownloadDone}|{m.Error}|{m.Attachments.Count}|{m.Tools.Count}|{(_copied == m ? 1 : 0)}|{_copiedCode}";
+        var key = $"{W}|{m.Content.Length}|{m.Thinking.Length}|{thinkOpen}|{m.Streaming}|{m.DownloadStatus}|{m.DownloadDone}|{m.Error}|{m.Attachments.Count}|{m.Tools.Count}|{string.Join("", m.Tools.TakeLast(2))}|{m.BackupDir != null && Directory.Exists(m.BackupDir)}|{(_copied == m ? 1 : 0)}|{_copiedCode}";
         if (_cache.TryGetValue(m, out var cached) && cached.Key == key) return cached;
         var l = new Laid { Key = key };
         int y = 0;
@@ -326,8 +327,19 @@ sealed class ChatView : ScrollableControl
                 R = new Rectangle(-2, y - 2, cs.Width + 6, cs.Height + 4),
                 Act = () => { CopyText(m.Content); _copied = m; _copiedAt = DateTime.Now; Refresh(m); }
             });
+            int after = cs.Width + Theme.S(16);
             if (!string.IsNullOrEmpty(m.Model))
-                AddText(l, m.Model, Theme.Small, Theme.Faint, cs.Width + Theme.S(16), y, ui: true);
+            {
+                AddText(l, m.Model, Theme.Small, Theme.Faint, after, y, ui: true);
+                after += Theme.Measure(m.Model, Theme.Small).Width + Theme.S(16);
+            }
+            if (m.BackupDir != null && Directory.Exists(m.BackupDir))
+            {
+                var undo = "Undo file changes";
+                var us = Theme.Measure(undo, Theme.Small);
+                AddText(l, undo, Theme.Small, Theme.Blue, after, y, ui: true);
+                l.Hits.Add(new Hit { R = new Rectangle(after - 2, y - 2, us.Width + 6, us.Height + 4), Act = () => UndoRequested?.Invoke(m) });
+            }
             y += cs.Height;
         }
 
@@ -683,6 +695,8 @@ sealed class ChatView : ScrollableControl
             menu.Items.Add("Select all", null, (_, _) => SelectAll());
             if (m != null && m.Role == "user" && !Messages.Any(x => x.Streaming))
                 menu.Items.Add("Edit", null, (_, _) => EditRequested?.Invoke(m));
+            if (m != null && m.BackupDir != null && Directory.Exists(m.BackupDir) && !Messages.Any(x => x.Streaming))
+                menu.Items.Add("Undo file changes", null, (_, _) => UndoRequested?.Invoke(m));
             menu.Show(this, e.Location);
         }
     }

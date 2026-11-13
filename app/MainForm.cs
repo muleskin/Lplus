@@ -84,6 +84,7 @@ sealed class MainForm : Form
         _picker.Picked += (name, installed) => SelectModel(name);
         _chat.EditRequested += BeginEdit;
         _chat.RetryRequested += m => _ = Retry(m);
+        _chat.UndoRequested += UndoChanges;
 
         _sidebar.NewChat += NewChat;
         _sidebar.OpenChat += OpenChat;
@@ -356,6 +357,13 @@ sealed class MainForm : Form
         s.WindowWidth = _settings.WindowWidth;
         s.WindowHeight = _settings.WindowHeight;
         s.Mode = _settings.Mode;
+        if (s.AutoApprove && !_settings.AutoApprove
+            && MessageBox.Show(this, "With this on, in Code mode a model changes files in your project folder and runs build and test commands without asking you first.\n\nFile changes can be undone from the reply. Commands that are not ordinary build tools still ask.\n\nTurn it on?",
+                "Work without asking", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+        {
+            s.AutoApprove = false;
+            _settingsView.Load(s);
+        }
         bool serverChange = _settings.ServerDiffers(s);
         _settings = s;
         _store.SaveSettings(_settings);
@@ -651,6 +659,26 @@ sealed class MainForm : Form
 
     static string Shorten(string s) => s.Length > 160 ? s[..160] + "…" : s;
 
+    /// <summary>Puts the files a reply changed back as they were.</summary>
+    void UndoChanges(ChatMessage m)
+    {
+        if (m.BackupDir == null || _cts != null) return;
+        var files = Tools.ChangedFiles(m.BackupDir);
+        var names = string.Join("\n", files.Take(12)) + (files.Count > 12 ? $"\n… and {files.Count - 12} more" : "");
+        var which = files.Count == 1 ? "this file back as it was" : $"these {files.Count} files back as they were";
+        if (MessageBox.Show(this, $"Put {which} before this reply?\n\n{names}\n\nChanges made to them since then are lost too.",
+                "Undo file changes", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+        try
+        {
+            int n = Tools.UndoChanges(m.BackupDir);
+            m.Tools.Add($"Undone: {n} file{(n == 1 ? "" : "s")} put back as {(n == 1 ? "it was" : "they were")}");
+        }
+        catch (Exception ex) { MessageBox.Show(this, "The changes could not be undone: " + ex.Message, "Lplus"); return; }
+        m.BackupDir = null;
+        if (_chatId != null) _store.SaveMessage(_chatId, m);
+        _chat.Refresh(m);
+    }
+
     // ---------- MCP servers ----------
 
     /// <summary>Starts (or restarts) the servers in mcp.json and shows how each one is doing in Settings.</summary>
@@ -707,6 +735,8 @@ sealed class MainForm : Form
     {
         var key = folder + "|" + command;
         if (_allowedCommands.Contains(key)) return Task.FromResult(true);
+        // "Work without asking": ordinary build, test and run commands go ahead; anything else still asks.
+        if (_settings.AutoApprove && Tools.IsBuildCommand(command, folder)) return Task.FromResult(true);
         var run = new TaskDialogButton("Run");
         var no = new TaskDialogButton("Don't run");
         var page = new TaskDialogPage
@@ -728,6 +758,7 @@ sealed class MainForm : Form
     /// <summary>Asks before a model creates or replaces a file in the project folder.</summary>
     Task<bool> ConfirmWrite(string file, bool exists)
     {
+        if (_settings.AutoApprove) return Task.FromResult(true);   // a copy is kept, so the change can be undone
         var ask = exists
             ? $"The model wants to change this file:\n\n{file}\n\nChange it?"
             : $"The model wants to create this file:\n\n{file}\n\nCreate it?";
@@ -810,6 +841,38 @@ sealed class MainForm : Form
                 msgs.Insert(0, new JsonObject { ["role"] = "system", ["content"] = note });
             }
 
+            // Files this reply changes are copied first, so the whole reply can be undone.
+            bool changed = false;
+            void KeepCopy(string file)
+            {
+                try
+                {
+                    bot.BackupDir ??= Path.Combine(Paths.BackupDir, DateTime.Now.ToString("yyyyMMdd-HHmmss-fff"));
+                    Tools.KeepCopy(bot.BackupDir, folder, file);
+                }
+                catch (Exception ex) { Log.Warn("backup: " + ex.Message); }
+                changed = true;
+            }
+
+            // When the model says it is done after changing files, the project is built and tested, and the
+            // model is sent back to fix what fails.
+            async Task<string?> Check()
+            {
+                if (!changed || !Tools.HasFolder(folder)) return null;
+                changed = false;
+                int line = -1;
+                var problem = await Tools.Verify(folder, ConfirmCommand, text =>
+                {
+                    // "Checking…" is replaced by how it went.
+                    if (line >= 0 && line < bot.Tools.Count && bot.Tools[line].EndsWith("…")) bot.Tools[line] = text; else { bot.Tools.Add(text); line = bot.Tools.Count - 1; }
+                    _dirty = bot;
+                });
+                return problem;
+            }
+
+            // Code mode needs room for files and build output: at least 16k unless a size was chosen in Settings.
+            int context = _settings.ContextLength > 0 ? _settings.ContextLength : Tools.HasFolder(folder) && tools != null ? 16384 : 0;
+
             async Task<string> RunTool(string name, JsonNode? args)
             {
                 // Shown while a slow step (a build, a web page) is still running, then replaced by how it went.
@@ -818,7 +881,7 @@ sealed class MainForm : Form
                 bot.Tools.Add(did + " …");
                 int at = bot.Tools.Count - 1;
                 _dirty = bot;
-                var result = mcpTool == null ? await Tools.Run(name, args, folder, ConfirmWrite, web, ConfirmCommand)
+                var result = mcpTool == null ? await Tools.Run(name, args, folder, ConfirmWrite, web, ConfirmCommand, KeepCopy)
                     : ConfirmMcp(mcpTool, args) ? await mcpTool.Server.Call(mcpTool.Name, args) : Tools.Declined;
                 bot.Tools[at] = result.StartsWith("Error:") ? $"{did} — {Shorten(result[7..].TrimEnd('.'))}"
                     : result == Tools.Declined ? $"Not done (you said no): {did}"
@@ -842,7 +905,7 @@ sealed class MainForm : Form
                     bot.Content += c;
                 }
                 _dirty = bot;
-            }, ct);
+            }, ct, Tools.HasFolder(folder) && tools != null ? Check : null, context);
         }
         catch (OperationCanceledException) { }
         catch (HttpRequestException) { bot.Error = "Connection lost. Is the model server running?"; }

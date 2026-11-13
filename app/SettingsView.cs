@@ -109,6 +109,7 @@ sealed class SettingsView : Control
         {
             (gg, r) => ToggleRow(gg, r, "Tools", "Let models read this PC's clock and, in Code mode, work in your project folder.", _s.ToolsEnabled, v => _s.ToolsEnabled = v),
             (gg, r) => ToggleRow(gg, r, "Web access", "Let models search the web and read pages to look things up.", _s.WebEnabled, v => _s.WebEnabled = v),
+            (gg, r) => ToggleRow(gg, r, "Work without asking", "In Code mode, change files and run build and test commands without asking each time.", _s.AutoApprove, v => _s.AutoApprove = v),
             (gg, r) =>
             {
                 Row(gg, new Rectangle(r.X, r.Y, r.Width, Theme.S(60)), "Project folder", "In Code mode, models can read this folder, and change files and run commands after you confirm.");
@@ -128,7 +129,7 @@ sealed class SettingsView : Control
                     _hits.Add((rr, () => { _s.ProjectFolder = ""; Commit(); }));
                 }
             },
-        }, Theme.S(76), Theme.S(76), Theme.S(128));
+        }, Theme.S(76), Theme.S(76), Theme.S(76), Theme.S(128));
 
         // MCP servers: extra tools from the person's own servers.
         int mcpRows = Math.Max(1, McpLines.Count) + (McpNote != null ? 1 : 0);
