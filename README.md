@@ -12,6 +12,9 @@ chat window on top of it. Your chats stay on your machine.
 Get `Lplus.exe` from the [latest release](https://github.com/muleskin/Lplus/releases/latest).
 It is one self-contained file for 64-bit Windows, so you do not need to install .NET. Download it and run it.
 
+The [user guide](https://github.com/muleskin/Lplus/releases/latest/download/Lplus-User-Guide.docx)
+(Word) is on the same page.
+
 ## What it does
 
 - **Chat with local models.** Replies stream in as they are written, with Markdown, code blocks
