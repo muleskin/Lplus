@@ -20,8 +20,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Compile Remove="shots\**" />
-    <None Remove="shots\**" />
+    <Compile Remove="shots\**;publish\**" />
+    <None Remove="shots\**;publish\**" />
   </ItemGroup>
+
+  <!-- dotnet publish -p:PublishProfile=SingleExe  →  publish\Lplus.exe (one self-contained file) -->
 
 </Project>

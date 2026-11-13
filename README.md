@@ -7,6 +7,11 @@ chat window on top of it. Your chats stay on your machine.
 
 ![Lplus chat window](app/shots/demo.png)
 
+## Download
+
+Get `Lplus.exe` from the [latest release](https://github.com/muleskin/Lplus/releases/latest).
+It is one self-contained file for 64-bit Windows, so you do not need to install .NET. Download it and run it.
+
 ## What it does
 
 - **Chat with local models.** Replies stream in as they are written, with Markdown, code blocks
@@ -24,7 +29,7 @@ chat window on top of it. Your chats stay on your machine.
 
 ## What you need
 
-- 64-bit Windows with the .NET 10 runtime (or the SDK, to build).
+- 64-bit Windows.
 - A local model server installed. Lplus looks for it next to its own exe, in the usual install
   folder, and on your `PATH`. If a server is already answering on port 11434, Lplus uses that one.
 
