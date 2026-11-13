@@ -39,8 +39,8 @@ Needs the .NET 10 SDK on Windows.
 
 ```powershell
 cd app
-dotnet run          # run from source
-dotnet build        # app\bin\Debug\net10.0-windows\Lplus.exe
+dotnet run                                          # run from source
+dotnet publish -p:PublishProfile=SingleExe          # single self-contained exe in app\publish\Lplus.exe
 ```
 
 C# WinForms, drawn with its own controls. The only package is `Microsoft.Data.Sqlite`.
