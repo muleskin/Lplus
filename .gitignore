@@ -1,0 +1,16 @@
+# Only the README and the app source are published.
+/*
+!/.gitignore
+!/README.md
+!/app/
+
+# build output
+app/bin/
+app/obj/
+app/publish/
+
+# local notes and test output
+app/*.md
+app/*.json
+app/shots/*
+!app/shots/demo.png
