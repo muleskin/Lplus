@@ -8,28 +8,65 @@ namespace Lplus;
 
 record ModelInfo(string Name, long Size, string ParameterSize, string Family, bool Installed);
 
-/// <summary>Talks to the local model server's HTTP API.</summary>
+/// <summary>
+/// Talks to the model server's HTTP API. The server is the one on this PC unless an address is set in
+/// Settings (or in the OLLAMA_HOST environment variable): then it is another computer, such as a cloud pod.
+/// </summary>
 sealed class ServerClient
 {
-    public string BaseUrl { get; }
+    public const string Local = "http://127.0.0.1:11434";
+    public string BaseUrl { get; private set; }
+    /// <summary>True when the server is on another computer: Lplus then neither starts nor stops it.</summary>
+    public bool IsRemote { get; private set; }
     readonly HttpClient _http = new() { Timeout = Timeout.InfiniteTimeSpan };
 
     public ServerClient()
     {
-        BaseUrl = ResolveBase();
         _http.DefaultRequestHeaders.UserAgent.ParseAdd("Lplus/1.0");
+        BaseUrl = Local;
+        SetServer("", "");
     }
 
-    static string ResolveBase()
+    /// <summary>
+    /// Points the client at a server. An empty address means the OLLAMA_HOST variable, and without that
+    /// this PC. The key, when given, is sent with every request as "Authorization: Bearer key".
+    /// </summary>
+    public void SetServer(string? address, string? key)
     {
-        var host = Environment.GetEnvironmentVariable("OLLAMA_HOST");
-        if (string.IsNullOrWhiteSpace(host)) return "http://127.0.0.1:11434";
-        host = host.Trim();
-        if (!host.StartsWith("http", StringComparison.OrdinalIgnoreCase)) host = "http://" + host;
-        var u = new Uri(host);
-        var h = u.Host is "0.0.0.0" or "::" or "[::]" ? "127.0.0.1" : u.Host;
-        var port = u.IsDefaultPort && !host.Contains(":" + u.Port) ? 11434 : u.Port;
-        return $"{u.Scheme}://{h}:{port}";
+        var chosen = string.IsNullOrWhiteSpace(address) ? Environment.GetEnvironmentVariable("OLLAMA_HOST") : address;
+        BaseUrl = Normalize(chosen) ?? Local;
+        var host = new Uri(BaseUrl).Host;
+        IsRemote = !(host is "127.0.0.1" or "localhost" or "::1" or "[::1]");
+        _http.DefaultRequestHeaders.Authorization = string.IsNullOrWhiteSpace(key) ? null : new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", key.Trim());
+    }
+
+    /// <summary>
+    /// A typed address as a full one, or null when it is not an address. "host" and "host:port" are taken
+    /// as plain http with the usual port 11434; a name with dots and no port is a web address (https), which
+    /// is what a cloud pod's proxy address looks like. An address with http:// or https:// is kept as it is.
+    /// </summary>
+    public static string? Normalize(string? address)
+    {
+        var a = (address ?? "").Trim().TrimEnd('/');
+        if (a.Length == 0) return Local;
+        try
+        {
+            if (a.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || a.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                var u = new Uri(a);
+                var h = u.Host is "0.0.0.0" or "::" or "[::]" ? "127.0.0.1" : u.Host;
+                var path = u.AbsolutePath.TrimEnd('/');
+                return $"{u.Scheme}://{h}{(u.IsDefaultPort ? "" : ":" + u.Port)}{path}";
+            }
+            var bare = new Uri("http://" + a);
+            if (bare.Host.Length == 0) return null;
+            var host = bare.Host is "0.0.0.0" or "::" or "[::]" ? "127.0.0.1" : bare.Host;
+            bool hasPort = System.Text.RegularExpressions.Regex.IsMatch(a, @":\d+$");
+            bool isName = host.Contains('.') && !System.Net.IPAddress.TryParse(host, out _);
+            if (!hasPort && isName) return "https://" + host;
+            return $"http://{host}:{(hasPort ? bare.Port : 11434)}";
+        }
+        catch { return null; }
     }
 
     async Task<JsonNode?> GetJson(string path, TimeSpan timeout, CancellationToken ct = default)
@@ -43,7 +80,7 @@ sealed class ServerClient
 
     public async Task<string?> Version(TimeSpan? timeout = null)
     {
-        try { return (await GetJson("/api/version", timeout ?? TimeSpan.FromSeconds(2)))?["version"]?.GetValue<string>(); }
+        try { return (await GetJson("/api/version", timeout ?? TimeSpan.FromSeconds(IsRemote ? 8 : 2)))?["version"]?.GetValue<string>(); }
         catch { return null; }
     }
 
@@ -199,6 +236,16 @@ sealed class ServerManager : IDisposable
     public async Task Start()
     {
         Error = null;
+        if (_client.IsRemote)
+        {
+            // A server on another computer: nothing is started here, it only has to answer.
+            External = true;
+            var v = await _client.Version(TimeSpan.FromSeconds(15));
+            if (v == null) Error = $"The model server at {_client.BaseUrl} is not answering.";
+            Log.Info(v == null ? "remote model server is not answering" : $"using the remote model server (version {v})");
+            StateChanged?.Invoke();
+            return;
+        }
         if (await _client.Version() != null)
         {
             External = _proc == null;
@@ -260,8 +307,20 @@ sealed class ServerManager : IDisposable
     public async Task<bool> Apply(Settings s)
     {
         var changed = _settings.ServerDiffers(s);
+        bool moved = _settings.ServerAddress != s.ServerAddress || _settings.ServerKey != s.ServerKey;
         _settings = s.Clone();
         if (!changed) return true;
+        if (moved)
+        {
+            // A different server: the one Lplus started here (if any) is stopped, and the new one is looked for.
+            _client.SetServer(s.ServerAddress, s.ServerKey);
+            StopProcess();
+            _stopping = false;
+            External = false;
+            await Start();
+            return true;
+        }
+        if (_client.IsRemote) return true;   // the other settings are for a server started here
         if (External) return false;
         StopProcess();
         _stopping = false;

@@ -34,9 +34,9 @@ static class SelfTest
         return hub.Configs.Count > 0 && hub.Configs.Where(c => !c.Disabled).All(c => hub.StatusOf(c).ok) ? 0 : 1;
     }
 
-    static JsonArray WithMcp(JsonArray tools, McpHub hub)
+    static JsonArray WithMcp(JsonArray tools, McpHub hub, string question)
     {
-        foreach (var d in hub.Definitions()) tools.Add(d?.DeepClone());
+        foreach (var d in hub.Definitions(hub.Relevant(question))) tools.Add(d?.DeepClone());
         return tools;
     }
 
@@ -63,7 +63,7 @@ static class SelfTest
             foreach (var (name, status, _) in hub.Status()) P($"MCP server {name}: {status}");
             var msgs = new JsonArray
             {
-                new JsonObject { ["role"] = "system", ["content"] = Tools.SystemNote(canCall, folder, true) },
+                new JsonObject { ["role"] = "system", ["content"] = Tools.SystemNote(canCall, folder, true) + (canCall ? hub.Note(hub.Relevant(question)) : "") },
                 new JsonObject { ["role"] = "user", ["content"] = question },
             };
             bool changedFiles = false;
@@ -77,7 +77,8 @@ static class SelfTest
                 }
                 var result = await Tools.Run(name, args, folder, (f, e) => { P($"  ({(apply ? "allowed" : "declined")} write of {f})"); return Task.FromResult(apply); },
                     true, (c, f) => { P($"  ({(apply ? "allowed" : "declined")} command {c})"); return Task.FromResult(apply); },
-                    f => changedFiles = true);
+                    f => changedFiles = true,
+                    (l, c, f) => { P($"  ({(apply ? "allowed" : "declined")} {l} script: {c.Replace("\r", "").Replace("\n", " ⏎ ")})"); return Task.FromResult(apply); });
                 P($"TOOL {name} {args?.ToJsonString()} -> {result.Length} chars: {(result.Length > 300 ? result[..300] + "…" : result).Replace("\n", " | ")}");
                 return result;
             }
@@ -92,7 +93,7 @@ static class SelfTest
                 return problem;
             }
             await Tools.Converse(client, model, msgs, caps.Contains("thinking") ? JsonValue.Create(false) : null,
-                canCall ? WithMcp(Tools.Definitions(folder, true), hub) : null, RunTool, (c, _) => said.Append(c), cts.Token,
+                canCall ? WithMcp(Tools.Definitions(folder, true), hub, question) : null, RunTool, (c, _) => said.Append(c), cts.Token,
                 Tools.HasFolder(folder) ? Check : null, Tools.HasFolder(folder) ? 16384 : 0);
             P("ANSWER:");
             P(said.ToString());
@@ -148,8 +149,8 @@ static class SelfTest
 
             var clock = await Tools.Run("get_current_time", null, "", Yes);
             Check(clock.Contains(DateTime.Now.Year.ToString()) && clock.Contains("UTC"), "clock tool: " + clock);
-            Check(Tools.Definitions("").Count == 1 && Tools.Definitions("", web: true).Count == 3 && Tools.Definitions(proj).Count == 7 && Tools.Definitions(proj, web: true).Count == 9,
-                "tools offered: the clock alone, +2 with web access, +6 with a project folder");
+            Check(Tools.Definitions("").Count == 1 && Tools.Definitions("", web: true).Count == 3 && Tools.Definitions(proj).Count == 8 && Tools.Definitions(proj, web: true).Count == 10,
+                "tools offered: the clock alone, +2 with web access, +7 with a project folder");
             var asText = Tools.TextCalls("{\n  \"name\": \"list_files\",\n  \"arguments\": {}\n}\n\n{\n  \"name\": \"read_file\",\n  \"arguments\": {\n    \"path\": \"a {b}.js\"\n  }\n}", Tools.Definitions(proj));
             Check(asText.Count == 2 && asText[1]["function"]?["arguments"]?["path"]?.GetValue<string>() == "a {b}.js"
                 && Tools.TextCalls("{\"name\": \"list_files\"} and some words", Tools.Definitions(proj)).Count == 0
@@ -211,6 +212,122 @@ static class SelfTest
                     "a compiler run shows the error, and passes after the fix: " + bad.Split('\n').FirstOrDefault(l => l.Contains("error CS"))?.Trim());
             }
             else P("INFO the .NET SDK is not installed, so the compiler check was skipped");
+
+            // A model server on another computer (a cloud pod): addresses, the key, and nothing started here.
+            string N(string x) => ServerClient.Normalize(x) ?? "(none)";
+            Check(N("") == "http://127.0.0.1:11434" && N("https://abc123-11434.proxy.runpod.net/") == "https://abc123-11434.proxy.runpod.net"
+                && N("abc123-11434.proxy.runpod.net") == "https://abc123-11434.proxy.runpod.net" && N("203.0.113.5:40123") == "http://203.0.113.5:40123"
+                && N("203.0.113.5") == "http://203.0.113.5:11434" && N("0.0.0.0") == "http://127.0.0.1:11434" && N("0.0.0.0:11434") == "http://127.0.0.1:11434"
+                && N("mybox") == "http://mybox:11434" && N("http://mybox:8080/llm/") == "http://mybox:8080/llm" && N("https://example.com:8443") == "https://example.com:8443",
+                "server addresses are read the way they are typed: a pod's web address, host:port, a bare name, and \"all addresses\" as this PC");
+            // Stands in for a pod: a little relay on another loopback address (127.0.0.2 does not count as "this PC")
+            // that passes requests on to the real server, but only when they carry the right key.
+            var far = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Parse("127.0.0.2"), 0);
+            far.Start();
+            int farPort = ((System.Net.IPEndPoint)far.LocalEndpoint).Port;
+            {
+                using var pass = new HttpClient();
+                var relay = Task.Run(async () =>
+                {
+                    while (true)
+                    {
+                        System.Net.Sockets.TcpClient tcp;
+                        try { tcp = await far.AcceptTcpClientAsync(); } catch { break; }
+                        _ = Task.Run(async () =>
+                        {
+                            using var conn = tcp;
+                            try
+                            {
+                                var net = conn.GetStream();
+                                // The request: a first line, headers up to an empty line, then the body.
+                                var headBytes = new List<byte>();
+                                var one = new byte[1];
+                                while (headBytes.Count < 4 || !(headBytes[^4] == 13 && headBytes[^3] == 10 && headBytes[^2] == 13 && headBytes[^1] == 10))
+                                {
+                                    if (await net.ReadAsync(one) == 0) return;
+                                    headBytes.Add(one[0]);
+                                }
+                                var head = Encoding.ASCII.GetString(headBytes.ToArray()).Split("\r\n");
+                                var first = head[0].Split(' ');
+                                var headers = head.Skip(1).Where(l => l.Contains(':')).ToDictionary(l => l[..l.IndexOf(':')].Trim(), l => l[(l.IndexOf(':') + 1)..].Trim(), StringComparer.OrdinalIgnoreCase);
+                                var bodyBytes = new byte[headers.TryGetValue("Content-Length", out var cl) ? int.Parse(cl) : 0];
+                                for (int got = 0; got < bodyBytes.Length;) { int n = await net.ReadAsync(bodyBytes.AsMemory(got)); if (n == 0) return; got += n; }
+                                async Task Reply(string status, Stream? body)
+                                {
+                                    await net.WriteAsync(Encoding.ASCII.GetBytes($"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"));
+                                    if (body != null) await body.CopyToAsync(net);
+                                }
+                                if (!headers.TryGetValue("Authorization", out var auth) || auth != "Bearer pod-key" || !first[1].StartsWith("/pod/")) { await Reply("401 Unauthorized", null); return; }
+                                using var req = new HttpRequestMessage(new HttpMethod(first[0]), client.BaseUrl + first[1]["/pod".Length..]);
+                                if (bodyBytes.Length > 0) { req.Content = new ByteArrayContent(bodyBytes); req.Content.Headers.TryAddWithoutValidation("Content-Type", "application/json"); }
+                                using var resp = await pass.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
+                                await Reply($"{(int)resp.StatusCode} {resp.ReasonPhrase}", await resp.Content.ReadAsStreamAsync());
+                            }
+                            catch { }
+                        });
+                    }
+                });
+                var away = new ServerClient();
+                var podAddress = $"http://127.0.0.2:{farPort}/pod";
+                away.SetServer(podAddress, "pod-key");
+                var awayVersion = await away.Version();
+                var awayModels = awayVersion == null ? 0 : (await away.Models()).Count;
+                var awaySaid = new StringBuilder();
+                if (awayVersion != null)
+                    await away.Chat(model, new JsonArray { new JsonObject { ["role"] = "user", ["content"] = "Reply with exactly one word: ready" } }, caps.Contains("thinking") ? JsonValue.Create(false) : null, (c, _) => awaySaid.Append(c), cts.Token);
+                using var awayServer = new ServerManager(away, new Settings { ServerAddress = podAddress, ServerKey = "pod-key" });
+                await awayServer.Start();
+                bool hands = away.IsRemote && awayServer.External && !awayServer.Owned && awayServer.Error == null;
+                away.SetServer(podAddress, "wrong");
+                var keyRefused = await away.Version();
+                Check(awayVersion == v && awayModels == models.Count && awaySaid.Length > 0 && hands && keyRefused == null,
+                    $"a server on another computer is used through its address and key (version {awayVersion}, {awayModels} models, reply \"{awaySaid.ToString().Trim()}\"); nothing is started here, and a wrong key is refused");
+                var gone = new ServerClient();
+                gone.SetServer($"http://127.0.0.2:{farPort}/nothing-here", "");
+                using var goneServer = new ServerManager(gone, new Settings());
+                await goneServer.Start();
+                Check(goneServer.Error != null && goneServer.Error.Contains("is not answering") && !goneServer.Owned, "a remote server that does not answer is reported, and no local one is started in its place: " + goneServer.Error);
+                far.Stop();
+            }
+            using (var sealedStore = new Store(Path.Combine(proj, "sealed.sqlite")))
+            {
+                sealedStore.SaveSettings(new Settings { ServerAddress = "https://abc-11434.proxy.runpod.net", ServerKey = "secret-key-123" });
+                var back2 = sealedStore.LoadSettings();
+                Check(back2.ServerAddress == "https://abc-11434.proxy.runpod.net" && back2.ServerKey == "secret-key-123", "the server's address and key are saved and read back");
+            }
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            Check(!System.Text.Encoding.UTF8.GetString(File.ReadAllBytes(Path.Combine(proj, "sealed.sqlite"))).Contains("secret-key-123")
+                && !(File.Exists(Path.Combine(proj, "sealed.sqlite-wal")) && System.Text.Encoding.UTF8.GetString(File.ReadAllBytes(Path.Combine(proj, "sealed.sqlite-wal"))).Contains("secret-key-123")),
+                "the key is not stored in readable form");
+
+            // Scripts: each language that is installed runs in the project folder; the person is always asked.
+            Task<bool> YesScript(string l, string c, string f) => Task.FromResult(true);
+            async Task<string> Script(string language, string code, string args = "") =>
+                (await Tools.Run("run_script", A(("language", language), ("code", code), ("arguments", args)), proj, Yes, false, null, null, YesScript)).Replace("\r", "");
+            var ps = await Script("powershell", "$n = (Get-ChildItem -Recurse -File -Filter *.py | Measure-Object).Count\nWrite-Output \"py files: $n\"\nWrite-Output (Split-Path -Leaf (Get-Location))\nWrite-Output \"arg: $($args[0])\"", "\"two words\"");
+            Check(ps.StartsWith("Exit code 0 (success)") && ps.Contains("py files: ") && ps.Contains(Path.GetFileName(proj)) && ps.Contains("arg: two words"), "a PowerShell script runs in the project folder: " + ps.Replace("\n", " | "));
+            var cmdOut = await Script("bat", "@echo off\nset X=from cmd\necho %X% %1\nexit /b 4", "seven");
+            Check(cmdOut.StartsWith("Exit code 4 (failed)") && cmdOut.Contains("from cmd seven"), "a cmd script runs and its exit code comes back: " + cmdOut.Replace("\n", " | "));
+            foreach (var (language, code, expect) in new[]
+            {
+                ("python", "import os, sys\nprint('files:', sorted(os.listdir('src'))[0])\nprint('arg:', sys.argv[1])\nprint('caf\\u00e9')", "files: app.py"),
+                ("bash", "set -e\ncount=$(ls src | wc -l)\necho \"entries: $count\"\necho \"arg: $1\"", "entries: "),
+            })
+            {
+                if (Tools.Interpreter(language) == null) { P($"INFO {language} is not installed, so its script check was skipped"); continue; }
+                var o = await Script(language, code, "hello");
+                Check(o.StartsWith("Exit code 0 (success)") && o.Contains(expect) && o.Contains("arg: hello"), $"a {language} script runs in the project folder: " + o.Replace("\n", " | "));
+            }
+            File.WriteAllText(Path.Combine(proj, "src", "status.ps1"), "Write-Output \"status ok: $($args[0])\"");
+            var saved = (await Tools.Run("run_script", A(("path", "src/status.ps1"), ("arguments", "v2")), proj, Yes, false, null, null, YesScript)).Replace("\r", "");
+            string asked = "";
+            var declinedScript = await Tools.Run("run_script", A(("language", "powershell"), ("code", "Remove-Item x")), proj, Yes, false, null, null, (l, c, f) => { asked = l + "|" + c; return Task.FromResult(false); });
+            var nobody = await Tools.Run("run_script", A(("language", "python"), ("code", "print(1)")), proj, Yes);
+            var badLang = await Tools.Run("run_script", A(("language", "ruby"), ("code", "puts 1")), proj, Yes, false, null, null, YesScript);
+            var outsideScript = await Tools.Run("run_script", A(("path", "..\\..\\x.ps1")), proj, Yes, false, null, null, YesScript);
+            Check(saved.StartsWith("Exit code 0") && saved.Contains("status ok: v2") && declinedScript == Tools.Declined && asked == "powershell|Remove-Item x" && nobody == Tools.Declined
+                && badLang.Contains("must be one of") && outsideScript.Contains("outside the project folder") && !Directory.EnumerateFiles(Path.Combine(Path.GetTempPath(), "lplus-scripts")).Any(),
+                "a saved script runs by its path; the person is shown the script and nothing runs without a yes; throwaway script files are removed");
 
             // Working on a project as a whole: what kind it is, which commands are ordinary build tools, undo, trimming.
             var kinds = Path.Combine(proj, "kinds");
@@ -332,6 +449,19 @@ static class SelfTest
                     "MCP servers started (a program and a web address) and a broken one is reported: " + string.Join("; ", st.Select(x => $"{x.name} = {x.status}")));
                 Check(hub.Tools.Count == 6 && hub.Find("local_add") != null && hub.Find("remote_echo") != null && hub.Definitions().Count == 6,
                     "their tools are offered as: " + string.Join(", ", hub.Tools.Select(t => t.Exposed)));
+                // With more tools than a model handles well, only the ones that fit the request are offered.
+                string Fit(string about) => string.Join(",", hub.Relevant(about, max: 2).Select(t => t.Exposed));
+                var f1 = Fit("use the remote server to echo hello");
+                var f2 = Fit("please add 2 and 3");
+                var f3 = Fit("use local to add 2 and 3");
+                var f4 = string.Join(",", hub.Relevant("add a feature and check the status", max: 4).Select(x => x.Exposed));
+                Check(f1 == "remote_echo,remote_add" && f2 == "" && f3 == "local_add,local_echo" && f4 == "local_add,local_echo,local_fail" && hub.Relevant("anything").Count == 6
+                    && hub.Note(hub.Relevant("x", 2)).Contains("not loaded") && hub.Definitions(hub.Relevant("use local to add", 2)).Count == 2,
+                    $"with many server tools, a large server is offered only when it is named ({f1}; unnamed = \"{f2}\") and a small one always, while there is room ({f4})");
+                var bare = Tools.TextCalls("{\"name\": \"echo\", \"arguments\": {}}", hub.Definitions());
+                var bare1 = Tools.TextCalls("{\"name\": \"echo\", \"arguments\": {\"text\": \"x\"}}", hub.Definitions(hub.Tools.Where(t => t.Server.Config.Name == "local").ToList()));
+                Check(bare.Count == 0 && bare1.Count == 1 && bare1[0]["function"]?["name"]?.GetValue<string>() == "local_echo",
+                    "a server tool asked for by its bare name is matched when only one server has it");
                 if (hub.Find("local_add") is { } add && hub.Find("remote_echo") is { } echo && hub.Find("local_fail") is { } fail && hub.Find("remote_add") is { } radd)
                 {
                     var sum = await add.Server.Call(add.Name, new JsonObject { ["a"] = 2, ["b"] = 3 });

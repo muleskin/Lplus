@@ -49,6 +49,8 @@ static partial class Tools
                 + " (it replaces the whole file, so send the complete new contents)."
                 + " After changing code, call run_command to build or test it (for example \"dotnet build\", \"npm test\", \"cargo build\", \"python -m pytest\"),"
                 + " read the errors and fix them, and repeat until it works. To find a bug, run the program or its tests with run_command and read what it prints."
+                + " For a check that needs more than one command (the state of the project, git status, what changed, sizes and counts of files, settings),"
+                + " write a short script and run it with run_script in powershell, python, cmd or bash; to keep a script for later, save it in the project with write_file and run it by its path."
                 + " Paths are relative to the project folder." + ProjectNote(folder)
               : "");
 
@@ -90,6 +92,11 @@ static partial class Tools
             ("content", "string", "The complete new contents of the file.", true)));
         list.Add(Fn("run_command", "Run a build, test or other command-line tool in the project folder and get its output. The user is asked to confirm.",
             ("command", "string", "The command line, for example: dotnet build", true)));
+        list.Add(Fn("run_script", "Run a PowerShell, Python, cmd or bash script in the project folder and get its output. Use it for checks that need several steps, such as looking at git status, counting or comparing files, or inspecting settings. Give the script's text in code, or the path of a script file that is already in the project. The user is asked to confirm.",
+            ("language", "string", "powershell, python, cmd or bash. Not needed when path is given.", false),
+            ("code", "string", "The whole script to run.", false),
+            ("path", "string", "A script file in the project to run instead of code, for example scripts/check.ps1", false),
+            ("arguments", "string", "Arguments to pass to the script.", false)));
         return list;
     }
 
@@ -129,6 +136,7 @@ static partial class Tools
         "write_file" => $"Saved {Arg(args, "path")}",
         "edit_file" => $"Edited {Arg(args, "path")}",
         "run_command" => $"Ran {Arg(args, "command")}",
+        "run_script" => Arg(args, "path") is { Length: > 0 } sp ? $"Ran the script {sp}" : $"Ran a {ScriptLanguage(args)} script",
         "web_search" => $"Searched the web for \"{Arg(args, "query")}\"",
         "fetch_url" => $"Read {Arg(args, "url")}",
         _ => name,
@@ -142,7 +150,8 @@ static partial class Tools
     /// is refused when nobody can be asked. Problems come back as "Error: ..." so the model can try something else.
     /// </summary>
     public static async Task<string> Run(string name, JsonNode? args, string folder, Func<string, bool, Task<bool>> confirmWrite,
-        bool web = false, Func<string, string, Task<bool>>? confirmCommand = null, Action<string>? beforeChange = null)
+        bool web = false, Func<string, string, Task<bool>>? confirmCommand = null, Action<string>? beforeChange = null,
+        Func<string, string, string, Task<bool>>? confirmScript = null)
     {
         try
         {
@@ -241,6 +250,25 @@ static partial class Tools
                     if (command.Length == 0) return "Error: command is empty.";
                     if (confirmCommand == null || !await confirmCommand(command, root)) return Declined;
                     return await RunCommand(root, command);
+                }
+                case "run_script":
+                {
+                    var language = ScriptLanguage(args);
+                    var code = Arg(args, "code");
+                    var path = Arg(args, "path").Trim();
+                    string? file = null;
+                    if (path.Length > 0)
+                    {
+                        file = Resolve(root, path);
+                        if (!File.Exists(file)) return "Error: that script file does not exist. Create it with write_file first, or give the script's text in code.";
+                        if (language.Length == 0) language = ScriptKindOf(file);
+                        code = await File.ReadAllTextAsync(file);
+                    }
+                    else if (code.Trim().Length == 0) return "Error: give the script's text in code, or the path of a script file in the project.";
+                    if (!ScriptKinds.ContainsKey(language)) return "Error: language must be one of powershell, python, cmd or bash.";
+                    // confirmScript(language, what will run, folder): the person sees the whole script first.
+                    if (confirmScript == null || !await confirmScript(language, file != null ? $"# {Rel(root, file)}\n{code}" : code, root)) return Declined;
+                    return await RunScript(root, language, file == null ? code : null, file, Arg(args, "arguments"));
                 }
                 default: return $"Error: there is no tool called {name}.";
             }
@@ -350,6 +378,16 @@ static partial class Tools
         }
         catch { return true; }
     }
+
+    /// <summary>The script language asked for, with the usual other names for each taken too.</summary>
+    static string ScriptLanguage(JsonNode? args) => Arg(args, "language").Trim().ToLowerInvariant() switch
+    {
+        "powershell" or "pwsh" or "ps" or "ps1" => "powershell",
+        "python" or "py" or "python3" => "python",
+        "cmd" or "bat" or "batch" => "cmd",
+        "bash" or "sh" or "shell" => "bash",
+        var other => other,
+    };
 
     static int Int(JsonNode? args, string name) => int.TryParse(Arg(args, name), out var n) ? n : 0;
 
@@ -461,7 +499,14 @@ static partial class Tools
             var fn = o["function"] as JsonObject ?? o;
             string? name;
             try { name = fn["name"]?.GetValue<string>(); } catch { return false; }
-            if (name == null || !known.Contains(name)) return false;
+            if (name == null) return false;
+            if (!known.Contains(name))
+            {
+                // A server's tool called by its own name, without the server in front: taken when only one fits.
+                var fits = known.Where(k => k!.EndsWith("_" + name, StringComparison.OrdinalIgnoreCase)).ToList();
+                if (fits.Count != 1) return false;
+                name = fits[0];
+            }
             var args = fn["arguments"] ?? fn["parameters"];
             found.Add(new JsonObject { ["function"] = new JsonObject { ["name"] = name, ["arguments"] = args?.DeepClone() ?? new JsonObject() } });
             return true;

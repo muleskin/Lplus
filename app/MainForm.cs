@@ -48,6 +48,7 @@ sealed class MainForm : Form
         _store = store;
         _screenshot = screenshot;
         _settings = store.LoadSettings();
+        _client.SetServer(_settings.ServerAddress, _settings.ServerKey);
         _server = new ServerManager(_client, _settings);
         _mcpView = new McpView(_mcp) { Dock = DockStyle.Fill, Visible = false };
 
@@ -99,6 +100,12 @@ sealed class MainForm : Form
         _settingsView.Changed += s => _ = ApplySettings(s);
         _settingsView.ViewLogs += ViewLogs;
         _settingsView.ManageMcp += ShowMcpPage;
+        _settingsView.ChangeServer += () =>
+        {
+            var (address, key) = _settingsView.Server;
+            using var dlg = new ServerDialog(address, key);
+            if (dlg.ShowDialog(this) == DialogResult.OK) _settingsView.SetServer(dlg.Address, dlg.Key);
+        };
         _sidebar.OpenMcp += ShowMcpPage;
         _mcpView.Changed += ShowMcp;
 
@@ -154,6 +161,19 @@ sealed class MainForm : Form
             if (page == "settings")
             {
                 ShowSettings();
+                // The Model server form too, saved as its own picture.
+                if (Environment.GetEnvironmentVariable("LPLUS_SHOT_DIALOG") is { Length: > 0 } serverShot)
+                {
+                    using var dlg = new ServerDialog("https://abc123-11434.proxy.runpod.net", "");
+                    dlg.StartPosition = FormStartPosition.Manual;
+                    dlg.Location = new Point(-4000, -4000);
+                    dlg.Show();
+                    Application.DoEvents();
+                    using var bmp = new Bitmap(dlg.Width, dlg.Height);
+                    dlg.DrawToBitmap(bmp, new Rectangle(0, 0, dlg.Width, dlg.Height));
+                    bmp.Save(serverShot, System.Drawing.Imaging.ImageFormat.Png);
+                    dlg.Close();
+                }
                 // For checking the lower part of the page: scroll down and show sample server lines.
                 if (int.TryParse(Environment.GetEnvironmentVariable("LPLUS_SHOT_SCROLL"), out var down))
                 {
@@ -320,8 +340,8 @@ sealed class MainForm : Form
         try
         {
             var loaded = await GpuStatus.Loaded(_client);
-            var devices = await Task.Run(GpuStatus.Devices);
-            if (!IsDisposed) _status.Update(loaded, devices);
+            var devices = _client.IsRemote ? new List<ComputeDevice>() : await Task.Run(GpuStatus.Devices);
+            if (!IsDisposed) _status.Update(loaded, devices, _client.IsRemote ? new Uri(_client.BaseUrl).Host : null);
         }
         finally { _gpuPolling = false; }
     }
@@ -338,7 +358,7 @@ sealed class MainForm : Form
         var v = await _client.Version();
         if (IsDisposed) return;
         _settingsView.ServerStatus = v != null ? $"Running (version {v})" : "Not running";
-        _settingsView.ServerDetail = v == null ? (_server.Error ?? "") : _server.External ? "started by another app" : "started by Lplus";
+        _settingsView.ServerDetail = v == null ? (_server.Error ?? "") : _client.IsRemote ? "on another computer" : _server.External ? "started by another app" : "started by Lplus";
         _settingsView.Invalidate();
         SetBanner(v == null ? (_server.Error ?? "Starting the model server…") : null);
     }
@@ -730,6 +750,34 @@ sealed class MainForm : Form
     // Commands the person said need not be asked about again, until Lplus is closed: "folder|command".
     readonly HashSet<string> _allowedCommands = new(StringComparer.OrdinalIgnoreCase);
 
+    bool _allowScripts;   // the person said scripts need not be asked about again, until Lplus is closed
+
+    /// <summary>Shows a script the model wants to run, whole, and asks. Scripts always ask, even when working without asking.</summary>
+    Task<bool> ConfirmScript(string language, string script, string folder)
+    {
+        if (_allowScripts) return Task.FromResult(true);
+        var run = new TaskDialogButton("Run");
+        var no = new TaskDialogButton("Don't run");
+        var shown = script.Replace("\r\n", "\n").TrimEnd();
+        if (shown.Length > 4000) shown = shown[..4000] + $"\n… ({script.Length - 4000} more characters not shown)";
+        var page = new TaskDialogPage
+        {
+            Caption = "Lplus",
+            Heading = $"The model wants to run this {language} script",
+            Text = "in " + folder + "\n\nRead it before you allow it: it runs with your own rights on this PC.",
+            Icon = TaskDialogIcon.Warning,
+            Buttons = { run, no },
+            DefaultButton = no,
+            Expander = new TaskDialogExpander(shown) { Expanded = true, CollapsedButtonText = "Show the script", ExpandedButtonText = "Hide the script", Position = TaskDialogExpanderPosition.AfterText },
+            Verification = new TaskDialogVerificationCheckBox("Don't ask again for scripts until Lplus is closed"),
+            AllowCancel = true,
+            SizeToContent = true,
+        };
+        bool ok = TaskDialog.ShowDialog(this, page) == run;
+        if (ok && page.Verification.Checked) _allowScripts = true;
+        return Task.FromResult(ok);
+    }
+
     /// <summary>Asks before a model runs a command in the project folder.</summary>
     Task<bool> ConfirmCommand(string command, string folder)
     {
@@ -833,10 +881,12 @@ sealed class MainForm : Form
                 var note = Tools.SystemNote(tools != null, folder, web);
                 if (tools != null && _mcp.Tools.Count > 0)
                 {
-                    // Tools from the person's MCP servers, in both modes.
-                    foreach (var d in _mcp.Definitions()) tools.Add(d?.DeepClone());
-                    note += " More tools come from the user's own servers (" + string.Join(", ", _mcp.Servers.Where(s => s.Ready).Select(s => s.Config.Name))
-                        + "); use them when they fit the request.";
+                    // Tools from the person's MCP servers, in both modes. With many of them, only the ones that
+                    // fit what was asked lately are offered: hundreds of tools make a model pick wrong ones.
+                    var asked = string.Join(" ", history.Where(m => m.Role == "user").TakeLast(3).Select(m => m.Content));
+                    var offered = _mcp.Relevant(asked);
+                    foreach (var d in _mcp.Definitions(offered)) tools.Add(d?.DeepClone());
+                    note += _mcp.Note(offered);
                 }
                 msgs.Insert(0, new JsonObject { ["role"] = "system", ["content"] = note });
             }
@@ -881,11 +931,11 @@ sealed class MainForm : Form
                 bot.Tools.Add(did + " …");
                 int at = bot.Tools.Count - 1;
                 _dirty = bot;
-                var result = mcpTool == null ? await Tools.Run(name, args, folder, ConfirmWrite, web, ConfirmCommand, KeepCopy)
+                var result = mcpTool == null ? await Tools.Run(name, args, folder, ConfirmWrite, web, ConfirmCommand, KeepCopy, ConfirmScript)
                     : ConfirmMcp(mcpTool, args) ? await mcpTool.Server.Call(mcpTool.Name, args) : Tools.Declined;
                 bot.Tools[at] = result.StartsWith("Error:") ? $"{did} — {Shorten(result[7..].TrimEnd('.'))}"
                     : result == Tools.Declined ? $"Not done (you said no): {did}"
-                    : name == "run_command" ? $"{did} — {Shorten(result.Split('\n')[0].TrimEnd('.'))}"
+                    : name is "run_command" or "run_script" ? $"{did} — {Shorten(result.Split('\n')[0].TrimEnd('.'))}"
                     : did;
                 if (bot.Content.Length > 0 && !bot.Content.EndsWith("\n\n")) bot.Content += "\n\n";
                 _dirty = bot;

@@ -55,6 +55,8 @@ class Settings
     public int WindowWidth = 1000;
     public int WindowHeight = 720;
     public bool ToolsEnabled = true;     // the model may read the clock and use the project folder
+    public string ServerAddress = "";    // where the model server is; empty = this PC
+    public string ServerKey = "";        // sent as "Authorization: Bearer", for servers that ask for one
     public bool AutoApprove = false;     // Code mode: change files and run build and test commands without asking each time
     public bool WebEnabled = true;       // the model may search the web and read pages
     public string Mode = "chat";         // "chat", or "code" = the model works in the project folder
@@ -65,7 +67,8 @@ class Settings
     /// <summary>The settings that change how the model server is started.</summary>
     public bool ServerDiffers(Settings o) =>
         Expose != o.Expose || Browser != o.Browser || Models != o.Models ||
-        ContextLength != o.ContextLength || CloudEnabled != o.CloudEnabled;
+        ContextLength != o.ContextLength || CloudEnabled != o.CloudEnabled ||
+        ServerAddress != o.ServerAddress || ServerKey != o.ServerKey;
 }
 
 /// <summary>SQLite store for chats, messages and settings.</summary>
@@ -271,6 +274,8 @@ thinking_time_start=$ts, thinking_time_end=$te, attachments=$a, error=$e, tools=
         s.ProjectFolder = T("project_folder", s.ProjectFolder);
         s.WebEnabled = B("web_enabled", s.WebEnabled);
         s.AutoApprove = B("auto_approve", s.AutoApprove);
+        s.ServerAddress = T("server_address", s.ServerAddress);
+        s.ServerKey = Unseal(T("server_key", ""));
         s.Mode = T("mode", s.Mode) == "code" ? "code" : "chat";
         return s;
     }
@@ -294,7 +299,24 @@ thinking_time_start=$ts, thinking_time_end=$te, attachments=$a, error=$e, tools=
         P("project_folder", s.ProjectFolder);
         P("web_enabled", B(s.WebEnabled));
         P("auto_approve", B(s.AutoApprove));
+        P("server_address", s.ServerAddress);
+        P("server_key", Seal(s.ServerKey));
         P("mode", s.Mode);
+    }
+
+    // The server key is kept so that only this Windows account can read it back.
+    static string Seal(string secret)
+    {
+        if (secret.Length == 0) return "";
+        try { return Convert.ToBase64String(System.Security.Cryptography.ProtectedData.Protect(System.Text.Encoding.UTF8.GetBytes(secret), null, System.Security.Cryptography.DataProtectionScope.CurrentUser)); }
+        catch { return ""; }
+    }
+
+    static string Unseal(string stored)
+    {
+        if (stored.Length == 0) return "";
+        try { return System.Text.Encoding.UTF8.GetString(System.Security.Cryptography.ProtectedData.Unprotect(Convert.FromBase64String(stored), null, System.Security.Cryptography.DataProtectionScope.CurrentUser)); }
+        catch { return ""; }
     }
 
     public void Dispose() => _db.Dispose();

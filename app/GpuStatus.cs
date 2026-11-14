@@ -87,10 +87,11 @@ sealed class StatusBar : Control
     static string Gb(long b) => $"{b / 1_000_000_000.0:0.0} GB";
 
     /// <summary>Works out the bar's state and both texts (no drawing, so it can be tested on its own).</summary>
-    public static (State state, string left, string right, float share) Describe(List<LoadedModel>? loaded, List<ComputeDevice> devices)
+    public static (State state, string left, string right, float share) Describe(List<LoadedModel>? loaded, List<ComputeDevice> devices, string? remote = null)
     {
         var gpus = devices.Where(d => !string.Equals(d.Library, "cpu", StringComparison.OrdinalIgnoreCase)).ToList();
-        var right = gpus.Count > 0
+        // A server on another computer: its graphics card cannot be seen from here, so the server is named instead.
+        var right = remote != null ? "Server: " + remote : gpus.Count > 0
             ? string.Join("  ·  ", gpus.Select(d => $"{d.Description} ({d.Library}{(d.Total.Length > 0 ? ", " + d.Total : "")})"))
             : devices.Count > 0 ? "No GPU found — models run on the CPU" : "Graphics card: not reported yet";
         if (loaded == null) return (State.NotRunning, "The model server isn't running", right, -1);
@@ -104,9 +105,9 @@ sealed class StatusBar : Control
         return (State.Split, $"GPU partly used · {names} · {pct}% GPU / {100 - pct}% CPU", right, share);
     }
 
-    public void Update(List<LoadedModel>? loaded, List<ComputeDevice> devices)
+    public void Update(List<LoadedModel>? loaded, List<ComputeDevice> devices, string? remote = null)
     {
-        (_state, _left, _right, _gpuShare) = Describe(loaded, devices);
+        (_state, _left, _right, _gpuShare) = Describe(loaded, devices, remote);
         Invalidate();
     }
 

@@ -539,11 +539,49 @@ sealed class McpHub : IDisposable
 
     public McpTool? Find(string exposed) => Tools.FirstOrDefault(t => t.Exposed == exposed);
 
-    /// <summary>The servers' tools in the form /api/chat takes.</summary>
-    public JsonArray Definitions()
+    public const int MaxOffered = 24;   // more tools than this and a model starts picking wrong ones
+
+    /// <summary>
+    /// The tools worth offering for what the person wrote. With few tools that is all of them. With many:
+    /// servers with only a handful of tools are always offered (while there is room), and a large server
+    /// is offered only when the person names it, its tools that fit the words used first, up to MaxOffered.
+    /// Ordinary words are not matched against tool names: "add", "check" or "status" fit far too much.
+    /// </summary>
+    public List<McpTool> Relevant(string about, int max = MaxOffered)
+    {
+        if (Tools.Count <= max) return Tools.ToList();
+        static HashSet<string> Words(string s) => Regex.Matches(s.ToLowerInvariant(), "[a-z0-9]{3,}").Select(m => m.Value).ToHashSet();
+        var said = Words(about);
+        var generic = new HashSet<string> { "mcp", "server", "servers", "tool", "tools", "the", "and", "get", "set", "list", "run", "for" };
+        int small = Math.Min(8, max);
+        var offered = new List<McpTool>();
+        var groups = Tools.GroupBy(t => t.Server).ToList();
+        // Named servers first: they are what the person asked for.
+        foreach (var g in groups.Where(g => Words(g.Key.Config.Name).Any(w => !generic.Contains(w) && said.Contains(w))))
+            offered.AddRange(g.OrderByDescending(t => Words(t.Name.Replace('_', ' ')).Count(w => !generic.Contains(w) && said.Contains(w))).Take(max - offered.Count));
+        foreach (var g in groups.Where(g => g.Count() <= small && !offered.Any(t => t.Server == g.Key)))
+            if (offered.Count + g.Count() <= max) offered.AddRange(g);
+        return offered;
+    }
+
+    /// <summary>What the model is told about the servers when only some of their tools are offered.</summary>
+    public string Note(List<McpTool> offered)
+    {
+        var ready = Servers.Where(s => s.Ready && s.Tools.Count > 0).ToList();
+        if (ready.Count == 0) return "";
+        if (offered.Count == Tools.Count)
+            return " More tools come from the user's own servers (" + string.Join(", ", ready.Select(s => s.Config.Name)) + "); use them when they fit the request.";
+        var all = string.Join(", ", ready.Select(s => $"{s.Config.Name} ({s.Tools.Count} tools)"));
+        return offered.Count == 0
+            ? $" The user also has these tool servers: {all}. Their tools are not loaded for this message. If the user wants one of them used, ask them to name the server in their message; do not pretend to call its tools."
+            : $" The user's tool servers are: {all}. The tools that fit this message are loaded ({string.Join(", ", offered.Select(t => t.Exposed).Take(12))}{(offered.Count > 12 ? ", …" : "")}); use them only when the request is about that server.";
+    }
+
+    /// <summary>The servers' tools in the form /api/chat takes (all of them, or just the ones given).</summary>
+    public JsonArray Definitions(List<McpTool>? only = null)
     {
         var list = new JsonArray();
-        foreach (var t in Tools)
+        foreach (var t in only ?? Tools)
         {
             var schema = t.Schema is JsonObject o ? (JsonObject)o.DeepClone() : new JsonObject();
             schema["type"] = "object";

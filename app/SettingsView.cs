@@ -22,6 +22,7 @@ sealed class SettingsView : Control
     public event Action<Settings>? Changed;
     public event Action? ViewLogs;
     public event Action? ManageMcp;
+    public event Action? ChangeServer;
     /// <summary>One line per MCP server: its name, what it is doing, and whether it works.</summary>
     public List<(string name, string status, bool ok)> McpLines = new();
     public string? McpNote;
@@ -34,6 +35,10 @@ sealed class SettingsView : Control
     }
 
     public void Load(Settings s) { _s = s.Clone(); Invalidate(); }
+
+    /// <summary>Sets where the model server is (from the Model server form) and saves.</summary>
+    public void SetServer(string address, string key) { _s.ServerAddress = address; _s.ServerKey = key; Commit(); }
+    public (string address, string key) Server => (_s.ServerAddress, _s.ServerKey);
     public void ScrollTo(int pixels) { _scroll = Math.Max(0, pixels); Invalidate(); }
 
     void Commit()
@@ -67,6 +72,13 @@ sealed class SettingsView : Control
                 Row(gg, r, "Server", ServerStatus + (ServerDetail.Length > 0 ? " · " + ServerDetail : ""));
                 var lr = Button(gg, "View logs", r.Right - Theme.S(16), r.Y + r.Height / 2);
                 _hits.Add((lr, () => ViewLogs?.Invoke()));
+            },
+            (gg, r) =>
+            {
+                Row(gg, new Rectangle(r.X, r.Y, r.Width - Theme.S(20), r.Height), "Server location",
+                    string.IsNullOrWhiteSpace(_s.ServerAddress) ? "This PC" : ServerClient.Normalize(_s.ServerAddress) ?? _s.ServerAddress);
+                var cr = Button(gg, "Change", r.Right - Theme.S(16), r.Y + r.Height / 2);
+                _hits.Add((cr, () => ChangeServer?.Invoke()));
             },
         }, Theme.S(72));
         if (ApplyNote != null)

@@ -155,11 +155,113 @@ static partial class Tools
         psi.ArgumentList.Add("/s");
         psi.ArgumentList.Add("/c");
         psi.ArgumentList.Add(command);
+        return await RunStarted(psi, limit);
+    }
+
+    /// <summary>The languages run_script takes, with the file ending each script is saved under.</summary>
+    public static readonly Dictionary<string, string> ScriptKinds = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["powershell"] = ".ps1", ["python"] = ".py", ["cmd"] = ".cmd", ["bash"] = ".sh",
+    };
+
+    /// <summary>The language a script file is in, from its ending ("" when it is not one Lplus runs).</summary>
+    public static string ScriptKindOf(string file) =>
+        Path.GetExtension(file).ToLowerInvariant() switch { ".ps1" => "powershell", ".py" => "python", ".cmd" or ".bat" => "cmd", ".sh" => "bash", _ => "" };
+
+    /// <summary>The program that runs a kind of script on this PC, or null when it is not installed.</summary>
+    public static string? Interpreter(string language)
+    {
+        static string? OnPath(params string[] names)
+        {
+            foreach (var name in names)
+                foreach (var dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    try { var full = Path.Combine(dir.Trim().Trim('"'), name); if (File.Exists(full)) return full; } catch { }
+                }
+            return null;
+        }
+        switch (language.ToLowerInvariant())
+        {
+            case "powershell": return OnPath("pwsh.exe", "powershell.exe");
+            case "python": return OnPath("python.exe", "py.exe", "python3.exe");
+            case "cmd": return Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe";
+            case "bash":
+                // The bash that comes with Git works on Windows paths; the one in System32 opens Linux instead, so it is the last choice.
+                foreach (var root in new[] { Environment.SpecialFolder.ProgramFiles, Environment.SpecialFolder.ProgramFilesX86, Environment.SpecialFolder.LocalApplicationData })
+                    foreach (var rel in new[] { @"Git\bin\bash.exe", @"Programs\Git\bin\bash.exe" })
+                    {
+                        var full = Path.Combine(Environment.GetFolderPath(root), rel);
+                        if (File.Exists(full)) return full;
+                    }
+                return OnPath("bash.exe");
+            default: return null;
+        }
+    }
+
+    /// <summary>
+    /// Runs a script in the project folder and returns its exit code and output. The script is either the
+    /// text given (saved to a throwaway file first) or a file already in the project. The caller asks the
+    /// person first; this only runs it.
+    /// </summary>
+    public static async Task<string> RunScript(string root, string language, string? code, string? file, string arguments, TimeSpan? timeout = null)
+    {
+        var exe = Interpreter(language);
+        if (exe == null) return $"Error: {language} is not installed on this PC. Use one of the others: powershell, python, cmd, bash.";
+        string? temp = null;
+        if (file == null)
+        {
+            var dir = Path.Combine(Path.GetTempPath(), "lplus-scripts");
+            Directory.CreateDirectory(dir);
+            temp = file = Path.Combine(dir, Guid.NewGuid().ToString("N") + ScriptKinds[language]);
+            // Line ends the way each language wants them; PowerShell needs a mark at the front to read other alphabets.
+            var text = (code ?? "").Replace("\r\n", "\n");
+            if (language.Equals("bash", StringComparison.OrdinalIgnoreCase)) await File.WriteAllTextAsync(file, text, new UTF8Encoding(false));
+            else await File.WriteAllTextAsync(file, text.Replace("\n", "\r\n"), new UTF8Encoding(language.Equals("powershell", StringComparison.OrdinalIgnoreCase)));
+        }
+        try
+        {
+            var psi = new ProcessStartInfo(exe)
+            {
+                WorkingDirectory = root, UseShellExecute = false, CreateNoWindow = true,
+                RedirectStandardOutput = true, RedirectStandardError = true, RedirectStandardInput = true,
+            };
+            var more = System.Text.RegularExpressions.Regex.Matches(arguments ?? "", "\"[^\"]*\"|\\S+").Select(m => m.Value.Trim('"'));
+            switch (language.ToLowerInvariant())
+            {
+                case "powershell":
+                    foreach (var a in new[] { "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", file }) psi.ArgumentList.Add(a);
+                    foreach (var a in more) psi.ArgumentList.Add(a);
+                    break;
+                case "python":
+                    if (Path.GetFileName(exe).Equals("py.exe", StringComparison.OrdinalIgnoreCase)) psi.ArgumentList.Add("-3");
+                    psi.ArgumentList.Add(file);
+                    foreach (var a in more) psi.ArgumentList.Add(a);
+                    psi.Environment["PYTHONIOENCODING"] = "utf-8";
+                    psi.Environment["PYTHONUNBUFFERED"] = "1";
+                    break;
+                case "bash":
+                    psi.ArgumentList.Add(file.Replace('\\', '/'));
+                    foreach (var a in more) psi.ArgumentList.Add(a);
+                    break;
+                default:   // cmd
+                    psi.Arguments = "/d /s /c \"\"" + file + "\" " + arguments + "\"";
+                    break;
+            }
+            return await RunStarted(psi, timeout ?? CommandTimeout);
+        }
+        finally { if (temp != null) try { File.Delete(temp); } catch { } }
+    }
+
+    /// <summary>Starts the prepared program, waits for it (up to the limit) and reports how it ended and what it printed.</summary>
+    static async Task<string> RunStarted(ProcessStartInfo psi, TimeSpan limit)
+    {
         // Build tools print plainer, shorter output when they know nobody is watching a console.
         psi.Environment["DOTNET_CLI_UI_LANGUAGE"] = "en";
         psi.Environment["DOTNET_NOLOGO"] = "1";
         psi.Environment["NO_COLOR"] = "1";
         psi.Environment["CI"] = "1";
+        psi.StandardOutputEncoding = Encoding.UTF8;
+        psi.StandardErrorEncoding = Encoding.UTF8;
 
         var output = new StringBuilder();
         using var p = new Process { StartInfo = psi };
